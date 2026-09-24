@@ -2902,4 +2902,6 @@ app.get('/', (req, res) => res.send('Bot is alive.'));
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime(), guilds: client.guilds.cache.size }));
 app.listen(process.env.PORT || 3000, () => console.log(`Web server listening on port ${process.env.PORT || 3000}`));
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN)
+  .then(() => console.log('Login promise resolved.'))
+  .catch((err) => console.error('LOGIN FAILED:', err));
