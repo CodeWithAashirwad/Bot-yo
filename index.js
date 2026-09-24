@@ -2889,19 +2889,82 @@ async function handleModal(interaction) {
 }
 
 // ---------------------------------------------------------------------------
-// GLOBAL ERROR HANDLING
+// STARTUP / ERROR HANDLING
 // ---------------------------------------------------------------------------
-process.on('uncaughtException', (err) => { console.error('Uncaught Exception:', err); flushDBSync(); });
-process.on('unhandledRejection', (err) => { console.error('Unhandled Rejection:', err); flushDBSync(); });
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  flushDBSync();
+});
 
-// ---------------------------------------------------------------------------
-// KEEP-ALIVE WEB SERVER
-// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled Rejection:', err);
+  flushDBSync();
+});
+
 const app = express();
-app.get('/', (req, res) => res.send('Bot is alive.'));
-app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime(), guilds: client.guilds.cache.size }));
-app.listen(process.env.PORT || 3000, () => console.log(`Web server listening on port ${process.env.PORT || 3000}`));
+const port = Number(process.env.PORT || 3000);
 
-client.login(process.env.DISCORD_TOKEN)
-  .then(() => console.log('Login promise resolved.'))
-  .catch((err) => console.error('LOGIN FAILED:', err));
+app.get('/', (req, res) => res.send('Bot is alive.'));
+app.get('/health', (req, res) => res.json({
+  status: client.isReady() ? 'discord-online' : 'discord-connecting',
+  uptime: process.uptime(),
+  guilds: client.guilds.cache.size,
+}));
+
+app.listen(port, () => {
+  console.log(`Web server listening on port ${port}`);
+});
+
+client.on('ready', () => {
+  console.log(`✅ Discord bot online as ${client.user.tag}`);
+});
+
+client.on('error', (error) => {
+  console.error('Discord client error:', error);
+});
+
+client.on('shardError', (error) => {
+  console.error('Discord shard error:', error);
+});
+
+client.on('warn', (warning) => {
+  console.warn('Discord warning:', warning);
+});
+
+const token = String(
+  process.env.DISCORD_TOKEN ||
+  process.env.DISCORD_BOT_TOKEN ||
+  '',
+).trim();
+
+if (!token) {
+  console.error('❌ DISCORD_TOKEN is missing.');
+  console.error('Add DISCORD_TOKEN to your hosting provider environment variables.');
+  process.exit(1);
+}
+
+console.log('Starting Discord login...');
+
+const loginTimeout = setTimeout(() => {
+  if (!client.isReady()) {
+    console.error('❌ Discord login timed out after 45 seconds.');
+    console.error('Check the bot token, network access, and Discord gateway status.');
+    process.exit(1);
+  }
+}, 45_000);
+
+client.login(token)
+  .then(() => {
+    clearTimeout(loginTimeout);
+    console.log('Discord login completed.');
+  })
+  .catch((error) => {
+    clearTimeout(loginTimeout);
+    console.error('❌ Discord login failed.');
+    console.error({
+      name: error?.name,
+      code: error?.code,
+      message: error?.message,
+    });
+    process.exit(1);
+  });
