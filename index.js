@@ -1194,7 +1194,7 @@ setInterval(serverStatsTick, 10 * 60 * 1000);
 // ---------------------------------------------------------------------------
 // EVENT: READY
 // ---------------------------------------------------------------------------
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   await registerCommands();
   client.user.setPresence({ activities: [{ name: '/help' }], status: 'online' });
