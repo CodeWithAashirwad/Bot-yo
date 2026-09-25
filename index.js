@@ -32,7 +32,7 @@ const {
   SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder,
   ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder,
   TextInputBuilder, TextInputStyle, ChannelType, AttachmentBuilder,
-  PermissionsBitField, MessageFlags,
+  PermissionsBitField, MessageFlags,PermissionsBitField,
 } = require('discord.js');
 
 // ---------------------------------------------------------------------------
