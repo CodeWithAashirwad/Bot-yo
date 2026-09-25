@@ -2915,7 +2915,7 @@ app.listen(port, () => {
   console.log(`Web server listening on port ${port}`);
 });
 
-client.on('ready', () => {
+client.on('clientReady', () => {
   console.log(`✅ Discord bot online as ${client.user.tag}`);
 });
 
