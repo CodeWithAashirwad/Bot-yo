@@ -2,22 +2,8 @@
  * ALL-IN-ONE DISCORD BOT — single file (index.js)
  * Discord.js v14
  *
- * Persistence: flat JSON file (./data/db.json), loaded into memory and
- * written to disk (debounced) on every mutation. Simple, dependency-free,
- * survives restarts.
- *
- * NOTE ON SCOPE: This file implements a real, working core of every system
- * requested (super admin / extra owner / protected users, moderation,
- * anti-spam, basic anti-nuke, bad words, tickets, welcome/goodbye, autorole,
- * sticky roles, AFK, invites, reaction roles, starboard, giveaways, polls,
- * reminders, custom commands, info commands, logging, help pagination,
- * botconfig UI). Anti-nuke "restoring deleted channels/roles" is implemented
- * as best-effort recreation (Discord does not let a bot literally undelete
- * an object — it can only recreate one with the same name/permissions from
- * cached data). Status-monitor / weather / QR code are implemented with
- * real network calls where a free, keyless API exists; where a paid key is
- * required, the command tells the operator which env var to set instead of
- * pretending to work.
+ * Persistence: flat JSON file (./data/db.json) with atomic crash-safe saves,
+ * plus a SQLite database (./data/tickets.db) for the ticket system.
  */
 
 require('dotenv').config();
@@ -36,7 +22,7 @@ const {
 } = require('discord.js');
 
 // ---------------------------------------------------------------------------
-// DATABASE (JSON file, in-memory cache + debounced save)
+// DATABASE (JSON file, in-memory cache + atomic crash-safe save)
 // ---------------------------------------------------------------------------
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
@@ -45,7 +31,7 @@ const DB_TMP_FILE = path.join(DATA_DIR, 'db.tmp.json');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const DEFAULT_DB = () => ({
-  guilds: {}, // per-guild config, keyed by guild id
+  guilds: {},
 });
 
 function loadDB() {
@@ -76,10 +62,6 @@ const db = loadDB();
 let saveTimer = null;
 let pendingSave = false;
 
-// Atomic, crash-safe save: write to a temp file, keep a rolling backup of the
-// last good save, then atomically rename the temp file into place. This
-// guarantees db.json is never left half-written even if the process dies
-// mid-save, and survives full bot/host restarts.
 function flushDBSync() {
   try {
     const json = JSON.stringify(db, null, 2);
@@ -100,12 +82,8 @@ function saveDB() {
   saveTimer = setTimeout(flushDBSync, 250);
 }
 
-// Safety net: flush unsaved changes every 30s even if nothing triggers a
-// debounced save in the meantime (belt-and-suspenders against edge cases).
 setInterval(() => { if (pendingSave) flushDBSync(); }, 30 * 1000);
 
-// Ensure data is written to disk before the process actually exits, whether
-// from a normal restart/deploy (SIGTERM/SIGINT) or a crash.
 function gracefulExit(signal) {
   console.log(`Received ${signal}, flushing database before exit...`);
   flushDBSync();
@@ -140,14 +118,14 @@ function defaultGuildConfig() {
       repeatedCharLimit: 8,
     },
     badwords: [],
-    warnings: {}, // userId -> [{reason, mod, ts}]
+    warnings: {},
     tickets: {
       categoryId: null,
       supportRoles: [],
-      panels: {}, // panelId -> {channelId, messageId, title, description, types:[]}
-      types: {}, // typeName -> {label, emoji}
-      openTickets: {}, // deprecated (JSON) — kept only for backward-compat migration; live data now in SQLite
-      userTicketCount: {}, // deprecated
+      panels: {},
+      types: {},
+      openTickets: {},
+      userTicketCount: {},
       logChannel: null,
       nextPanelId: 1,
       closedCount: 0,
@@ -155,32 +133,32 @@ function defaultGuildConfig() {
     welcome: { enabled: false, channelId: null, message: 'Welcome {user} to {server}! You are member #{membercount}.', embed: true, banner: null },
     goodbye: { enabled: false, channelId: null, message: '{username} has left {server}. We now have {membercount} members.', embed: true, banner: null },
     autorole: { roleId: null },
-    stickyroles: { enabled: false, store: {} }, // userId -> [roleIds]
+    stickyroles: { enabled: false, store: {} },
     verification: { enabled: false, roleId: null, channelId: null, messageId: null },
-    serverstats: { channels: {} }, // key -> channelId
-    starboard: { enabled: false, channelId: null, threshold: 3, messages: {} }, // origMsgId -> starboardMsgId
-    reactionroles: [], // {messageId, channelId, emoji, roleId}
+    serverstats: { channels: {} },
+    starboard: { enabled: false, channelId: null, threshold: 3, messages: {} },
+    reactionroles: [],
     autopublish: { channels: [] },
     logging: { channelId: null },
     dmlogs: [],
-    invites: { cache: {}, joins: {}, leaders: {} }, // code->uses, userId->{code,inviter}, inviterId->count
-    customcommands: {}, // name -> response
-    giveaways: {}, // messageId -> {channelId, prize, winners, endsAt, entrants:[], ended}
-    statusmonitors: [], // {url, lastStatus}
-    reminders: [], // {userId, channelId, remindAt, text, id}
-    afk: {}, // userId -> {reason, since}
+    invites: { cache: {}, joins: {}, leaders: {} },
+    customcommands: {},
+    giveaways: {},
+    statusmonitors: [],
+    reminders: [],
+    afk: {},
     ai: {
-      customPrompt: '', // Super Admin-editable addition to the AI's system prompt
-      memory: {}, // userId -> [{role, content}] rolling short-term memory
+      customPrompt: '',
+      memory: {},
     },
     applications: {
       reviewChannelId: null,
       resultDMs: true,
       questions: ['Why do you want to join the team?', 'Relevant experience?', 'How old are you?', 'Timezone?'],
-      panels: {}, // panelId -> {channelId, messageId, title, description, banner}
+      panels: {},
       nextPanelId: 1,
-      pendingByUser: {}, // userId -> true while an application is open, to prevent duplicate applications
-      submissions: [], // {userId, tag, answers:[], status: 'pending'|'accepted'|'denied', reviewedBy, ts}
+      pendingByUser: {},
+      submissions: [],
     },
   };
 }
@@ -190,7 +168,6 @@ function getGuild(guildId) {
     db.guilds[guildId] = defaultGuildConfig();
     saveDB();
   } else {
-    // backfill any missing keys from default (for upgrades)
     const def = defaultGuildConfig();
     for (const k of Object.keys(def)) {
       if (db.guilds[guildId][k] === undefined) db.guilds[guildId][k] = def[k];
@@ -248,7 +225,9 @@ const ticketDB = {
   getTranscript: sqlite.prepare(`SELECT * FROM ticket_transcripts WHERE channel_id = ? ORDER BY created_at ASC`),
 };
 
-
+// ---------------------------------------------------------------------------
+// CLIENT
+// ---------------------------------------------------------------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -272,9 +251,6 @@ const startTime = Date.now();
 // ---------------------------------------------------------------------------
 const LEVEL = { USER: 1, MOD: 2, ADMIN: 3, EXTRA_OWNER: 4, SUPER_ADMIN: 5, OWNER: 6 };
 
-// Bot Owner(s) — set via BOT_OWNER_IDS in .env (comma-separated Discord user
-// IDs). Bot Owners can run any command on any server, bypassing every
-// per-guild permission check, same as OWNER level everywhere.
 const BOT_OWNER_IDS = (process.env.BOT_OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 function isBotOwner(userId) {
   return BOT_OWNER_IDS.includes(userId);
@@ -295,8 +271,6 @@ function getLevel(guild, gconf, member) {
   if (member.id === guild.ownerId) return LEVEL.OWNER;
   if (gconf.superAdmins.includes(member.id)) return LEVEL.SUPER_ADMIN;
   if (gconf.extraOwners.includes(member.id)) return LEVEL.EXTRA_OWNER;
-  // Anyone holding real Discord Administrator permission (including via an
-  // "Administrator" role) is treated as a bot Super Admin as well.
   if (member.permissions?.has(PermissionFlagsBits.Administrator)) return LEVEL.SUPER_ADMIN;
   if (member.permissions?.has(PermissionFlagsBits.ModerateMembers) || member.permissions?.has(PermissionFlagsBits.KickMembers)) return LEVEL.MOD;
   return LEVEL.USER;
@@ -307,15 +281,10 @@ function requireLevel(interaction, gconf, min) {
   return lvl >= min;
 }
 
-// Super Admins (and the server owner) can run every command in this bot,
-// regardless of their raw Discord permissions — used to bypass permission
-// checks that are written against Discord permission flags rather than
-// bot permission levels.
 function isBotSuperAdmin(interaction, gconf) {
   return getLevel(interaction.guild, gconf, interaction.member) >= LEVEL.SUPER_ADMIN;
 }
 
-// bot hierarchy check: can the bot act on target member?
 function botCanActOn(guild, targetMember) {
   const me = guild.members.me;
   if (!me) return false;
@@ -512,7 +481,7 @@ cmd(new SlashCommandBuilder().setName('dm').setDescription('DM system')
     .addStringOption(o => o.setName('message').setDescription('Message').setRequired(true))));
 cmd(new SlashCommandBuilder().setName('dmlogs').setDescription('Show recent DM activity'));
 
-cmd(new SlashCommandBuilder().setName('invites').setDescription('Show your (or another user\'s) invite stats')
+cmd(new SlashCommandBuilder().setName('invites').setDescription("Show your (or another user's) invite stats")
   .addUserOption(o => o.setName('user').setDescription('User')));
 cmd(new SlashCommandBuilder().setName('inviteleaderboard').setDescription('Show invite leaderboard'));
 cmd(new SlashCommandBuilder().setName('resetinvites').setDescription('Reset all invite statistics'));
@@ -552,8 +521,8 @@ cmd(new SlashCommandBuilder().setName('afk').setDescription('Set your AFK status
 cmd(new SlashCommandBuilder().setName('serverinfo').setDescription('Show server information'));
 cmd(new SlashCommandBuilder().setName('userinfo').setDescription('Show user information').addUserOption(o => o.setName('user').setDescription('User')));
 cmd(new SlashCommandBuilder().setName('roleinfo').setDescription('Show role information').addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)));
-cmd(new SlashCommandBuilder().setName('avatar').setDescription('Show a user\'s avatar').addUserOption(o => o.setName('user').setDescription('User')));
-cmd(new SlashCommandBuilder().setName('banner').setDescription('Show a user\'s banner').addUserOption(o => o.setName('user').setDescription('User')));
+cmd(new SlashCommandBuilder().setName('avatar').setDescription("Show a user's avatar").addUserOption(o => o.setName('user').setDescription('User')));
+cmd(new SlashCommandBuilder().setName('banner').setDescription("Show a user's banner").addUserOption(o => o.setName('user').setDescription('User')));
 cmd(new SlashCommandBuilder().setName('membercount').setDescription('Show member count statistics'));
 cmd(new SlashCommandBuilder().setName('ping').setDescription('Show bot latency'));
 cmd(new SlashCommandBuilder().setName('stats').setDescription('Show bot statistics'));
@@ -621,7 +590,7 @@ cmd(new SlashCommandBuilder().setName('aiconfig').setDescription('Configure the 
   .addSubcommand(s => s.setName('setprompt').setDescription('Set a custom addition to the AI system prompt').addStringOption(o => o.setName('prompt').setDescription('Custom instructions for the AI').setRequired(true)))
   .addSubcommand(s => s.setName('viewprompt').setDescription('View the current custom AI prompt'))
   .addSubcommand(s => s.setName('resetprompt').setDescription('Reset the AI prompt to default'))
-  .addSubcommand(s => s.setName('clearmemory').setDescription('Clear the AI\'s remembered conversation history')
+  .addSubcommand(s => s.setName('clearmemory').setDescription("Clear the AI's remembered conversation history")
     .addUserOption(o => o.setName('user').setDescription('Clear memory for a specific user only (omit to clear everyone)'))));
 
 cmd(new SlashCommandBuilder().setName('announcement').setDescription('Send a formatted announcement')
@@ -689,7 +658,7 @@ async function tryDM(user, embed) {
 // ---------------------------------------------------------------------------
 // ANTI-NUKE TRACKING
 // ---------------------------------------------------------------------------
-const nukeTracker = new Map(); // guildId -> { userId -> { action -> [timestamps] } }
+const nukeTracker = new Map();
 
 function trackAction(guildId, userId, action) {
   if (!nukeTracker.has(guildId)) nukeTracker.set(guildId, new Map());
@@ -712,14 +681,12 @@ async function checkAntinuke(guild, executorId, action, entity) {
   const limit = th[action];
   if (!limit || arr.length < limit) return;
 
-  // Trigger response
   const member = await guild.members.fetch(executorId).catch(() => null);
   const priorTriggers = gconf.antinuke.logs.filter(l => l.executorId === executorId).length;
   let punished = false;
   let actionDesc = 'Could not act (hierarchy/permissions)';
   if (member && botCanActOn(guild, member)) {
     try {
-      // strip dangerous roles/permissions
       const dangerousRoles = member.roles.cache.filter(r =>
         r.permissions.has(PermissionFlagsBits.Administrator) ||
         r.permissions.has(PermissionFlagsBits.ManageGuild) ||
@@ -730,7 +697,6 @@ async function checkAntinuke(guild, executorId, action, entity) {
         await member.roles.remove(role, 'Anti-nuke: dangerous mass action detected').catch(() => {});
       }
       if (priorTriggers >= 1) {
-        // repeat offender within tracked history — strict escalation to ban
         await member.ban({ reason: 'Anti-nuke: repeat dangerous mass action detected' }).catch(() => {});
         actionDesc = 'Dangerous roles stripped + banned (repeat offender)';
       } else {
@@ -765,13 +731,10 @@ async function checkAntinuke(guild, executorId, action, entity) {
 // ---------------------------------------------------------------------------
 // ANTI-SPAM TRACKING (Discord-AutoMod style: detect -> block -> escalate)
 // ---------------------------------------------------------------------------
-const spamTracker = new Map(); // userId -> { timestamps: [], lastMsgs: [] }
+const spamTracker = new Map();
 const inviteRegex = /(discord\.gg|discord\.com\/invite)\/\S+/i;
 const linkRegex = /https?:\/\/\S+/gi;
 
-// Branded notification, sent whenever a member is actioned by
-// bad-word filtering, anti-spam, or anti-nuke. Posted both to the
-// configured log channel and in the channel where it happened.
 function vantixNoticeEmbed({ userId, type, action, reason }) {
   return new EmbedBuilder()
     .setColor(COLORS.warning)
@@ -808,23 +771,22 @@ async function applyEscalation(message, gconf, violation, offenseKey, member) {
 
   const noticeType = offenseKey === '[AutoMod-BadWord]' ? 'Blockword' : 'Automod';
   let actionTaken = 'Deleted + Warned';
-  let minutes = null;
   try {
     if (priorOffenses === 0) {
       await member?.timeout(5 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 5m Timeout'; minutes = 5;
+      actionTaken = 'Deleted + 5m Timeout';
     } else if (priorOffenses === 1) {
       await member?.timeout(30 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 30m Timeout'; minutes = 30;
+      actionTaken = 'Deleted + 30m Timeout';
     } else if (priorOffenses === 2) {
       await member?.timeout(6 * 60 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 6h Timeout'; minutes = 360;
+      actionTaken = 'Deleted + 6h Timeout';
     } else if (priorOffenses === 3) {
       await member?.timeout(24 * 60 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 24h Timeout'; minutes = 1440;
+      actionTaken = 'Deleted + 24h Timeout';
     } else {
       await member?.kick(reasonText).catch(() => {});
-      actionTaken = 'Deleted + Kicked'; minutes = null;
+      actionTaken = 'Deleted + Kicked';
     }
   } catch (e) { /* missing perms etc */ }
 
@@ -845,10 +807,6 @@ async function applyEscalation(message, gconf, violation, offenseKey, member) {
   await logEvent(message.guild, gconf, embed);
 }
 
-// Bad-word filter — behaves like a strict Discord AutoMod rule: runs
-// independently of the general anti-spam toggle, and is not bypassed
-// merely by having Manage Messages (only protected users / mods with
-// explicit bypass are exempt via isProtected + level check below).
 async function handleBadWords(message) {
   const gconf = getGuild(message.guild.id);
   if (!gconf.badwords || !gconf.badwords.length) return false;
@@ -857,9 +815,6 @@ async function handleBadWords(message) {
   const lower = message.content.toLowerCase();
   const hit = gconf.badwords.some(w => {
     const word = w.toLowerCase();
-    // strict whole-word-ish match (word boundaries) to reduce false positives
-    // while still catching leetspeak-free direct usage; falls back to substring
-    // match for multi-word phrases.
     const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const re = new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i');
     return re.test(lower) || lower.includes(word);
@@ -909,7 +864,6 @@ async function handleAntispam(message) {
   }
 
   if (!violation) return;
-  // Manage Messages holders bypass generic spam heuristics (still subject to bad-word filter above)
   if (member?.permissions.has(PermissionFlagsBits.ManageMessages)) return;
 
   await applyEscalation(message, gconf, violation, '[AutoMod-Spam]', member);
@@ -1068,7 +1022,7 @@ setInterval(statusMonitorTick, 60 * 1000);
 // ---------------------------------------------------------------------------
 // LIVE PING STATUS MESSAGE (edits every minute)
 // ---------------------------------------------------------------------------
-const pingStatusMessages = new Map(); // guildId -> { channelId, messageId }
+const pingStatusMessages = new Map();
 
 async function pingStatusTick() {
   for (const [guildId, info] of pingStatusMessages.entries()) {
@@ -1192,23 +1146,28 @@ async function serverStatsTick() {
 setInterval(serverStatsTick, 10 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
-// EVENT: READY
+// EVENT: READY (fires under 'ready' on this discord.js version; the alias
+// 'clientReady' is used in newer versions, so both are handled below).
 // ---------------------------------------------------------------------------
-client.once('ready', async () => {
+let readyHandled = false;
+async function handleClientReady() {
+  if (readyHandled) return;
+  readyHandled = true;
   console.log(`Logged in as ${client.user.tag}`);
   await registerCommands();
   client.user.setPresence({ activities: [{ name: '/help' }], status: 'online' });
-});
+}
+client.once('ready', handleClientReady);
+client.once('clientReady', handleClientReady);
 
 // ---------------------------------------------------------------------------
-// EVENT: GUILD MEMBER ADD (welcome, autorole, stickyroles, invites, antinuke join-spam)
+// EVENT: GUILD MEMBER ADD
 // ---------------------------------------------------------------------------
-const joinTracker = new Map(); // guildId -> timestamps
+const joinTracker = new Map();
 
 client.on('guildMemberAdd', async (member) => {
   const gconf = getGuild(member.guild.id);
 
-  // raid detection (join spam)
   const arr = joinTracker.get(member.guild.id) || [];
   arr.push(Date.now());
   const recent = arr.filter(t => Date.now() - t < 10000);
@@ -1221,19 +1180,16 @@ client.on('guildMemberAdd', async (member) => {
     }
   }
 
-  // autorole
   if (gconf.autorole.roleId) {
     const role = member.guild.roles.cache.get(gconf.autorole.roleId);
     if (role) await member.roles.add(role).catch(() => {});
   }
 
-  // sticky roles
   if (gconf.stickyroles.enabled && gconf.stickyroles.store[member.id]) {
     const roleIds = gconf.stickyroles.store[member.id].filter(id => member.guild.roles.cache.has(id));
     if (roleIds.length) await member.roles.add(roleIds).catch(() => {});
   }
 
-  // invite tracking
   try {
     const newInvites = await member.guild.invites.fetch();
     const cache = gconf.invites.cache;
@@ -1252,7 +1208,6 @@ client.on('guildMemberAdd', async (member) => {
     saveDB();
   } catch (e) { /* missing ManageGuild permission */ }
 
-  // welcome message
   if (gconf.welcome.enabled && gconf.welcome.channelId) {
     const ch = await member.guild.channels.fetch(gconf.welcome.channelId).catch(() => null);
     if (ch) {
@@ -1270,7 +1225,7 @@ client.on('guildMemberAdd', async (member) => {
 });
 
 // ---------------------------------------------------------------------------
-// EVENT: GUILD MEMBER REMOVE (goodbye, sticky role capture)
+// EVENT: GUILD MEMBER REMOVE
 // ---------------------------------------------------------------------------
 client.on('guildMemberRemove', async (member) => {
   const gconf = getGuild(member.guild.id);
@@ -1295,36 +1250,38 @@ client.on('guildMemberRemove', async (member) => {
       }
     }
   }
+
+  const log = await member.guild.fetchAuditLogs({ type: 20, limit: 1 }).catch(() => null);
+  const entry = log?.entries.first();
+  if (entry && entry.target?.id === member.id && Date.now() - entry.createdTimestamp < 5000) {
+    await checkAntinuke(member.guild, entry.executor.id, 'kick');
+  }
 });
 
 // ---------------------------------------------------------------------------
-// EVENT: MESSAGE CREATE (antispam, badwords, afk, custom commands)
+// EVENT: MESSAGE CREATE
 // ---------------------------------------------------------------------------
 client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot) return;
   const gconf = getGuild(message.guild.id);
 
-  // live ticket transcript logging
   const ticketRow = ticketDB.getOpenByChannel.get(message.channel.id);
   if (ticketRow) {
     const attachments = message.attachments.size ? [...message.attachments.values()].map(a => a.url).join(' ') : null;
     ticketDB.addTranscriptLine.run(message.channel.id, message.guild.id, message.author.tag, message.content || '', attachments, Date.now());
   }
 
-  // AFK removal
   if (gconf.afk[message.author.id]) {
     delete gconf.afk[message.author.id];
     saveDB();
     message.reply({ embeds: [infoEmbed('Welcome back — I removed your AFK status.', '👋 AFK Removed')] }).then(m => setTimeout(() => m.delete().catch(() => {}), 5000)).catch(() => {});
   }
-  // AFK mention notice
   for (const [, user] of message.mentions.users) {
     if (gconf.afk[user.id]) {
       message.reply({ embeds: [infoEmbed(`${user.username} is AFK: ${gconf.afk[user.id].reason}`, '💤 AFK')] }).catch(() => {});
     }
   }
 
-  // custom commands (prefix !)
   if (message.content.startsWith('!')) {
     const name = message.content.slice(1).split(' ')[0].toLowerCase();
     if (gconf.customcommands[name]) {
@@ -1333,23 +1290,22 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // AI chat — triggered by @mentioning the bot
   if (message.mentions.has(client.user)) {
     await handleAIChat(message).catch(e => console.error('AI chat error:', e));
     return;
   }
 
   const wordBlocked = await handleBadWords(message).catch(e => { console.error('badwords error:', e); return false; });
-  if (wordBlocked) return; // message already deleted + actioned; skip further spam checks on it
+  if (wordBlocked) return;
   await handleAntispam(message).catch(e => console.error('antispam error:', e));
+
+  if (message.channel.type === ChannelType.GuildAnnouncement && gconf.autopublish.channels.includes(message.channel.id)) {
+    message.crosspost().catch(() => {});
+  }
 });
 
 // ---------------------------------------------------------------------------
-// AI CHAT (OpenRouter) — "Jarvis": @mention the bot to chat, or ask it to
-// run basic server/bot actions in natural language (timeout, kick, ban,
-// warn, purge, lock/unlock, slowmode, add/remove role, announcements,
-// and remembering things about you). Super Admins can customize its
-// system prompt via /aiconfig, and it keeps short-term memory per user.
+// AI CHAT (OpenRouter) — "Jarvis"
 // ---------------------------------------------------------------------------
 async function callOpenRouter(messages) {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -1389,7 +1345,6 @@ function aiRememberExchange(gconf, userId, userText, assistantText) {
   saveDB();
 }
 
-// Fake "interaction-like" object so we can reuse requireLevel()/getLevel() helpers.
 function fakeInteraction(message) {
   return { guild: message.guild, member: message.member };
 }
@@ -1401,7 +1356,7 @@ async function handleAIChat(message) {
 
   const basePrompt = [
     'You are Jarvis, the AI assistant built into a Discord bot called VantixNodes.',
-    'You can chat normally like a helpful assistant, AND you can perform actions in this Discord server on the user\'s behalf when clearly asked.',
+    "You can chat normally like a helpful assistant, AND you can perform actions in this Discord server on the user's behalf when clearly asked.",
     'Available actions (reply with ONLY raw JSON, nothing else, when performing one):',
     '{"action":"timeout","targetId":"<user id>","minutes":<int>,"reason":"<text>"}',
     '{"action":"kick","targetId":"<user id>","reason":"<text>"}',
@@ -1451,14 +1406,11 @@ async function handleAIChat(message) {
     return;
   }
 
-  // Plain conversational reply.
   const replyText = result.content.slice(0, 1900);
   aiRememberExchange(gconf, message.author.id, cleaned, replyText);
   return message.reply({ content: replyText }).catch(() => {});
 }
 
-// Executes one AI-requested action, enforcing the same permission,
-// hierarchy, and protected-user rules as the equivalent slash command.
 async function executeAIAction(message, gconf, parsed) {
   const guild = message.guild;
   const fakeInt = fakeInteraction(message);
@@ -1585,7 +1537,7 @@ async function executeAIAction(message, gconf, parsed) {
 }
 
 // ---------------------------------------------------------------------------
-// EVENT: MESSAGE REACTION ADD (starboard, reaction roles)
+// EVENT: MESSAGE REACTION ADD/REMOVE
 // ---------------------------------------------------------------------------
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;
@@ -1597,7 +1549,6 @@ client.on('messageReactionAdd', async (reaction, user) => {
   if (!guild) return;
   const gconf = getGuild(guild.id);
 
-  // reaction roles
   const emojiKey = reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name;
   const rr = gconf.reactionroles.find(r => r.messageId === reaction.message.id && (r.emoji === emojiKey || r.emoji === reaction.emoji.name));
   if (rr) {
@@ -1605,7 +1556,6 @@ client.on('messageReactionAdd', async (reaction, user) => {
     if (member) await member.roles.add(rr.roleId).catch(() => {});
   }
 
-  // starboard
   if (gconf.starboard.enabled && ['⭐', '🌟'].includes(reaction.emoji.name)) {
     const count = reaction.count || 1;
     if (count >= gconf.starboard.threshold) {
@@ -1650,42 +1600,34 @@ client.on('messageReactionRemove', async (reaction) => {
 });
 
 // ---------------------------------------------------------------------------
-// EVENT: ANTI-NUKE TRIGGERS (channel/role/webhook create-delete, bans)
+// EVENT: ANTI-NUKE TRIGGERS
 // ---------------------------------------------------------------------------
 client.on('channelDelete', async (channel) => {
   if (!channel.guild) return;
-  const log = await channel.guild.fetchAuditLogs({ type: 12, limit: 1 }).catch(() => null); // CHANNEL_DELETE = 12
+  const log = await channel.guild.fetchAuditLogs({ type: 12, limit: 1 }).catch(() => null);
   const entry = log?.entries.first();
   if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(channel.guild, entry.executor.id, 'channelDelete');
 });
 client.on('channelCreate', async (channel) => {
   if (!channel.guild) return;
-  const log = await channel.guild.fetchAuditLogs({ type: 10, limit: 1 }).catch(() => null); // CHANNEL_CREATE = 10
+  const log = await channel.guild.fetchAuditLogs({ type: 10, limit: 1 }).catch(() => null);
   const entry = log?.entries.first();
   if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(channel.guild, entry.executor.id, 'channelCreate');
 });
 client.on('roleDelete', async (role) => {
-  const log = await role.guild.fetchAuditLogs({ type: 32, limit: 1 }).catch(() => null); // ROLE_DELETE = 32
+  const log = await role.guild.fetchAuditLogs({ type: 32, limit: 1 }).catch(() => null);
   const entry = log?.entries.first();
   if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(role.guild, entry.executor.id, 'roleDelete');
 });
 client.on('roleCreate', async (role) => {
-  const log = await role.guild.fetchAuditLogs({ type: 30, limit: 1 }).catch(() => null); // ROLE_CREATE = 30
+  const log = await role.guild.fetchAuditLogs({ type: 30, limit: 1 }).catch(() => null);
   const entry = log?.entries.first();
   if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(role.guild, entry.executor.id, 'roleCreate');
 });
 client.on('guildBanAdd', async (ban) => {
-  const log = await ban.guild.fetchAuditLogs({ type: 22, limit: 1 }).catch(() => null); // MEMBER_BAN_ADD = 22
+  const log = await ban.guild.fetchAuditLogs({ type: 22, limit: 1 }).catch(() => null);
   const entry = log?.entries.first();
   if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(ban.guild, entry.executor.id, 'ban');
-});
-client.on('guildMemberRemove', async (member) => {
-  // detect kicks specifically (separate from goodbye handler above; both listeners fire independently)
-  const log = await member.guild.fetchAuditLogs({ type: 20, limit: 1 }).catch(() => null); // MEMBER_KICK = 20
-  const entry = log?.entries.first();
-  if (entry && entry.target?.id === member.id && Date.now() - entry.createdTimestamp < 5000) {
-    await checkAntinuke(member.guild, entry.executor.id, 'kick');
-  }
 });
 client.on('webhooksUpdate', async (channel) => {
   if (!channel.guild) return;
@@ -1693,17 +1635,6 @@ client.on('webhooksUpdate', async (channel) => {
   const entry = log?.entries.first();
   if (entry && [50, 51, 52].includes(entry.action) && Date.now() - entry.createdTimestamp < 5000) {
     await checkAntinuke(channel.guild, entry.executor.id, 'webhook');
-  }
-});
-
-// ---------------------------------------------------------------------------
-// AUTO-PUBLISH
-// ---------------------------------------------------------------------------
-client.on('messageCreate', async (message) => {
-  if (!message.guild || message.channel.type !== ChannelType.GuildAnnouncement) return;
-  const gconf = getGuild(message.guild.id);
-  if (gconf.autopublish.channels.includes(message.channel.id)) {
-    message.crosspost().catch(() => {});
   }
 });
 
@@ -1718,7 +1649,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isModalSubmit()) return await handleModal(interaction);
   } catch (err) {
     console.error('Interaction error:', err);
-    await safeReply(interaction, { embeds: [errorEmbed('Something went wrong handling that interaction.')], ephemeral: true }).catch(() => {});
+    await safeReply(interaction, { embeds: [errorEmbed('Something went wrong handling that interaction.')], flags: MessageFlags.Ephemeral }).catch(() => {});
   }
 });
 
@@ -1727,14 +1658,13 @@ client.on('interactionCreate', async (interaction) => {
 // ---------------------------------------------------------------------------
 async function handleSlash(interaction) {
   const { commandName, guild } = interaction;
-  if (!guild) return safeReply(interaction, { embeds: [errorEmbed('This bot only works in servers.')], ephemeral: true });
+  if (!guild) return safeReply(interaction, { embeds: [errorEmbed('This bot only works in servers.')], flags: MessageFlags.Ephemeral });
   const gconf = getGuild(guild.id);
 
   switch (commandName) {
-    // ---------------- SUPER ADMIN ----------------
     case 'superadmin': {
       if (!isBotOwner(interaction.member.id) && interaction.member.id !== guild.ownerId && !gconf.superAdmins.includes(interaction.member.id)) {
-        return safeReply(interaction, { embeds: [errorEmbed('Only the server owner or existing super admins can manage this.')], ephemeral: true });
+        return safeReply(interaction, { embeds: [errorEmbed('Only the server owner or existing super admins can manage this.')], flags: MessageFlags.Ephemeral });
       }
       const sub = interaction.options.getSubcommand();
       if (sub === 'add') {
@@ -1755,9 +1685,8 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- EXTRA OWNER ----------------
     case 'extraowner': {
-      if (!requireLevel(interaction, gconf, LEVEL.SUPER_ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Super Admin or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.SUPER_ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Super Admin or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'add') {
         const user = interaction.options.getUser('user');
@@ -1777,15 +1706,13 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- BOTCONFIG ----------------
     case 'botconfig': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       return safeReply(interaction, { embeds: [infoEmbed('Select a system below to view/configure it.', '⚙️ Bot Configuration')], components: [botconfigMenu()] });
     }
 
-    // ---------------- ANTINUKE ----------------
     case 'antinuke': {
-      if (!requireLevel(interaction, gconf, LEVEL.EXTRA_OWNER)) return safeReply(interaction, { embeds: [errorEmbed('Requires Extra Owner or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.EXTRA_OWNER)) return safeReply(interaction, { embeds: [errorEmbed('Requires Extra Owner or higher.')], flags: MessageFlags.Ephemeral });
       const group = interaction.options.getSubcommandGroup(false);
       const sub = interaction.options.getSubcommand();
       if (group === 'whitelist') {
@@ -1834,9 +1761,8 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- ANTISPAM ----------------
     case 'antispam': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'enable') { gconf.antispam.enabled = true; saveDB(); return safeReply(interaction, { embeds: [successEmbed('Anti-spam enabled.')] }); }
       if (sub === 'disable') { gconf.antispam.enabled = false; saveDB(); return safeReply(interaction, { embeds: [successEmbed('Anti-spam disabled.')] }); }
@@ -1849,7 +1775,7 @@ async function handleSlash(interaction) {
           gconf.antispam.blockInvites = value.toLowerCase() === 'true';
         } else {
           const n = parseInt(value, 10);
-          if (Number.isNaN(n)) return safeReply(interaction, { embeds: [errorEmbed('Value must be a number for this setting.')], ephemeral: true });
+          if (Number.isNaN(n)) return safeReply(interaction, { embeds: [errorEmbed('Value must be a number for this setting.')], flags: MessageFlags.Ephemeral });
           gconf.antispam[setting] = n;
         }
         saveDB();
@@ -1858,53 +1784,51 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- BADWORDS ----------------
     case 'badwords': {
-      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'add') {
         const word = interaction.options.getString('word').toLowerCase();
         if (!gconf.badwords.includes(word)) gconf.badwords.push(word);
         saveDB();
-        return safeReply(interaction, { embeds: [successEmbed('Word added to the filter.')], ephemeral: true });
+        return safeReply(interaction, { embeds: [successEmbed('Word added to the filter.')], flags: MessageFlags.Ephemeral });
       }
       if (sub === 'remove') {
         const word = interaction.options.getString('word').toLowerCase();
         gconf.badwords = gconf.badwords.filter(w => w !== word);
         saveDB();
-        return safeReply(interaction, { embeds: [successEmbed('Word removed from the filter.')], ephemeral: true });
+        return safeReply(interaction, { embeds: [successEmbed('Word removed from the filter.')], flags: MessageFlags.Ephemeral });
       }
       if (sub === 'list') {
         try {
           await interaction.user.send({ embeds: [infoEmbed(gconf.badwords.length ? gconf.badwords.join(', ') : 'No words configured.', 'Bad Word List')] });
-          return safeReply(interaction, { embeds: [successEmbed('Sent you a DM with the list.')], ephemeral: true });
+          return safeReply(interaction, { embeds: [successEmbed('Sent you a DM with the list.')], flags: MessageFlags.Ephemeral });
         } catch {
-          return safeReply(interaction, { embeds: [errorEmbed('I could not DM you the list. Enable DMs from server members.')], ephemeral: true });
+          return safeReply(interaction, { embeds: [errorEmbed('I could not DM you the list. Enable DMs from server members.')], flags: MessageFlags.Ephemeral });
         }
       }
       break;
     }
 
-    // ---------------- MODERATION ----------------
     case 'ban': case 'kick': case 'timeout': case 'warn': {
       const targetUser = interaction.options.getUser('user');
       const reason = interaction.options.getString('reason') || 'No reason provided';
-      if (targetUser.id === interaction.user.id) return safeReply(interaction, { embeds: [errorEmbed('You cannot target yourself.')], ephemeral: true });
-      if (isProtected(guild, gconf, targetUser.id)) return safeReply(interaction, { embeds: [warnEmbed('This user is protected and cannot be moderated.')], ephemeral: true });
+      if (targetUser.id === interaction.user.id) return safeReply(interaction, { embeds: [errorEmbed('You cannot target yourself.')], flags: MessageFlags.Ephemeral });
+      if (isProtected(guild, gconf, targetUser.id)) return safeReply(interaction, { embeds: [warnEmbed('This user is protected and cannot be moderated.')], flags: MessageFlags.Ephemeral });
 
       const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
 
       const permMap = { ban: PermissionFlagsBits.BanMembers, kick: PermissionFlagsBits.KickMembers, timeout: PermissionFlagsBits.ModerateMembers, warn: PermissionFlagsBits.ModerateMembers };
       if (!interaction.member.permissions.has(permMap[commandName]) && !requireLevel(interaction, gconf, LEVEL.MOD)) {
-        return safeReply(interaction, { embeds: [errorEmbed('You lack permission to use this command.')], ephemeral: true });
+        return safeReply(interaction, { embeds: [errorEmbed('You lack permission to use this command.')], flags: MessageFlags.Ephemeral });
       }
 
       if (targetMember) {
         if (!actorOutranks(interaction.member, targetMember, guild, gconf) && !isBotSuperAdmin(interaction, gconf)) {
-          return safeReply(interaction, { embeds: [errorEmbed('You cannot moderate someone with an equal or higher role.')], ephemeral: true });
+          return safeReply(interaction, { embeds: [errorEmbed('You cannot moderate someone with an equal or higher role.')], flags: MessageFlags.Ephemeral });
         }
         if (commandName !== 'warn' && !botCanActOn(guild, targetMember)) {
-          return safeReply(interaction, { embeds: [errorEmbed("I don't have a high enough role to do that.")], ephemeral: true });
+          return safeReply(interaction, { embeds: [errorEmbed("I don't have a high enough role to do that.")], flags: MessageFlags.Ephemeral });
         }
       }
 
@@ -1920,8 +1844,8 @@ async function handleSlash(interaction) {
 
       if (commandName === 'timeout') {
         const durMs = parseDuration(interaction.options.getString('duration'));
-        if (!durMs || durMs > 28 * 86400000) return safeReply(interaction, { embeds: [errorEmbed('Invalid duration. Use formats like 10m, 1h, 1d (max 28d).')], ephemeral: true });
-        if (!targetMember) return safeReply(interaction, { embeds: [errorEmbed('That user is not in this server.')], ephemeral: true });
+        if (!durMs || durMs > 28 * 86400000) return safeReply(interaction, { embeds: [errorEmbed('Invalid duration. Use formats like 10m, 1h, 1d (max 28d).')], flags: MessageFlags.Ephemeral });
+        if (!targetMember) return safeReply(interaction, { embeds: [errorEmbed('That user is not in this server.')], flags: MessageFlags.Ephemeral });
         await targetMember.timeout(durMs, reason).catch(e => { throw e; });
         await tryDM(targetUser, warnEmbed(`You were timed out in **${guild.name}** for ${interaction.options.getString('duration')}: ${reason}`));
         const embed = successEmbed(`${targetUser} has been timed out for ${interaction.options.getString('duration')}.\nReason: ${reason}`, 'Member Timed Out');
@@ -1930,7 +1854,7 @@ async function handleSlash(interaction) {
       }
 
       if (commandName === 'kick') {
-        if (!targetMember) return safeReply(interaction, { embeds: [errorEmbed('That user is not in this server.')], ephemeral: true });
+        if (!targetMember) return safeReply(interaction, { embeds: [errorEmbed('That user is not in this server.')], flags: MessageFlags.Ephemeral });
         await tryDM(targetUser, warnEmbed(`You were kicked from **${guild.name}**: ${reason}`));
         await targetMember.kick(reason);
         const embed = successEmbed(`${targetUser} has been kicked.\nReason: ${reason}`, 'Member Kicked');
@@ -1955,16 +1879,16 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [infoEmbed(desc, `Warnings — ${user.tag}`)] });
     }
     case 'clearwarns': {
-      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], flags: MessageFlags.Ephemeral });
       const user = interaction.options.getUser('user');
       gconf.warnings[user.id] = [];
       saveDB();
       return safeReply(interaction, { embeds: [successEmbed(`Cleared warnings for ${user}.`)] });
     }
     case 'purge': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Messages permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Messages permission.')], flags: MessageFlags.Ephemeral });
       const amount = interaction.options.getInteger('amount');
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const deleted = await interaction.channel.bulkDelete(amount, true).catch(() => null);
       if (!deleted) return safeReply(interaction, { embeds: [errorEmbed('Could not delete messages (they may be older than 14 days).')] });
       const embed = successEmbed(`Deleted ${deleted.size} messages in ${interaction.channel}.`, 'Purge');
@@ -1972,28 +1896,26 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [embed] });
     }
     case 'lock': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], flags: MessageFlags.Ephemeral });
       await interaction.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false });
       return safeReply(interaction, { embeds: [successEmbed('Channel locked.')] });
     }
     case 'unlock': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], flags: MessageFlags.Ephemeral });
       await interaction.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null });
       return safeReply(interaction, { embeds: [successEmbed('Channel unlocked.')] });
     }
     case 'slowmode': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], flags: MessageFlags.Ephemeral });
       const secs = interaction.options.getInteger('seconds');
       await interaction.channel.setRateLimitPerUser(secs);
       return safeReply(interaction, { embeds: [successEmbed(`Slowmode set to ${secs}s.`)] });
     }
 
-    // ---------------- TICKETS ----------------
     case 'ticket': return handleTicketCommand(interaction, gconf);
 
-    // ---------------- WELCOME / GOODBYE ----------------
     case 'welcome': case 'goodbye': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const conf = gconf[commandName];
       const sub = interaction.options.getSubcommand();
       if (sub === 'setup') {
@@ -2007,13 +1929,13 @@ async function handleSlash(interaction) {
         return safeReply(interaction, { embeds: [successEmbed(`${commandName} messages configured in ${channel}.`)] });
       }
       if (sub === 'test') {
-        if (!conf.channelId) return safeReply(interaction, { embeds: [errorEmbed(`Run \`/${commandName} setup\` first.`)], ephemeral: true });
+        if (!conf.channelId) return safeReply(interaction, { embeds: [errorEmbed(`Run \`/${commandName} setup\` first.`)], flags: MessageFlags.Ephemeral });
         const ch = await guild.channels.fetch(conf.channelId).catch(() => null);
         const text = replaceVars(conf.message, { user: interaction.user, guild });
         const testEmbed = new EmbedBuilder().setColor(commandName === 'welcome' ? COLORS.success : COLORS.error).setDescription(text);
         if (conf.banner) testEmbed.setImage(conf.banner);
         if (ch) ch.send({ embeds: [testEmbed] });
-        return safeReply(interaction, { embeds: [successEmbed('Test message sent.')], ephemeral: true });
+        return safeReply(interaction, { embeds: [successEmbed('Test message sent.')], flags: MessageFlags.Ephemeral });
       }
       if (sub === 'disable') {
         conf.enabled = false; saveDB();
@@ -2022,12 +1944,11 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- DM SYSTEM ----------------
     case 'dm': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       const message = interaction.options.getString('message');
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       const embed = infoEmbed(message, `Message from ${guild.name}`);
       if (sub === 'user') {
         const user = interaction.options.getUser('user');
@@ -2043,7 +1964,7 @@ async function handleSlash(interaction) {
         for (const [, m] of members) {
           const ok = await tryDM(m.user, embed);
           if (ok) sent++; else failed++;
-          await new Promise(r => setTimeout(r, 800)); // rate-limit friendly
+          await new Promise(r => setTimeout(r, 800));
         }
         gconf.dmlogs.unshift({ type: 'role', target: role.id, sent, failed, ts: Date.now() }); gconf.dmlogs = gconf.dmlogs.slice(0, 200); saveDB();
         return safeReply(interaction, { embeds: [successEmbed(`Sent to ${sent} member(s), failed for ${failed}.`)] });
@@ -2063,13 +1984,12 @@ async function handleSlash(interaction) {
       break;
     }
     case 'dmlogs': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const logs = gconf.dmlogs.slice(0, 10);
       const desc = logs.length ? logs.map(l => `**${l.type}** ${l.target ? `→ <@${l.target}>` : ''} ${l.sent !== undefined ? `(${l.sent} sent / ${l.failed} failed)` : (l.ok ? '✅' : '❌')} — <t:${Math.floor(l.ts / 1000)}:R>`).join('\n') : 'No DM activity logged yet.';
       return safeReply(interaction, { embeds: [infoEmbed(desc, 'DM Logs')] });
     }
 
-    // ---------------- INVITES ----------------
     case 'invites': {
       const user = interaction.options.getUser('user') || interaction.user;
       const count = gconf.invites.leaders[user.id] || 0;
@@ -2081,15 +2001,14 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [infoEmbed(desc, '🏆 Invite Leaderboard')] });
     }
     case 'resetinvites': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       gconf.invites = { cache: {}, joins: {}, leaders: {} };
       saveDB();
       return safeReply(interaction, { embeds: [successEmbed('Invite statistics reset.')] });
     }
 
-    // ---------------- CUSTOM COMMANDS ----------------
     case 'customcommand': {
-      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'add') {
         const name = interaction.options.getString('name').toLowerCase();
@@ -2111,15 +2030,14 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- GIVEAWAY ----------------
     case 'giveaway': {
-      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'start') {
         const prize = interaction.options.getString('prize');
         const durMs = parseDuration(interaction.options.getString('duration'));
         const winners = interaction.options.getInteger('winners');
-        if (!durMs) return safeReply(interaction, { embeds: [errorEmbed('Invalid duration format. Use e.g. 10m, 1h, 1d.')], ephemeral: true });
+        if (!durMs) return safeReply(interaction, { embeds: [errorEmbed('Invalid duration format. Use e.g. 10m, 1h, 1d.')], flags: MessageFlags.Ephemeral });
         const endsAt = Date.now() + durMs;
         const embed = new EmbedBuilder().setColor(COLORS.info).setTitle('🎉 Giveaway!')
           .setDescription(`Prize: **${prize}**\nWinners: **${winners}**\nEnds: <t:${Math.floor(endsAt / 1000)}:R>\n\nClick the button below to enter!`)
@@ -2133,30 +2051,29 @@ async function handleSlash(interaction) {
       }
       if (sub === 'end') {
         const id = interaction.options.getString('messageid');
-        if (!gconf.giveaways[id]) return safeReply(interaction, { embeds: [errorEmbed('No giveaway found with that message ID.')], ephemeral: true });
+        if (!gconf.giveaways[id]) return safeReply(interaction, { embeds: [errorEmbed('No giveaway found with that message ID.')], flags: MessageFlags.Ephemeral });
         await endGiveaway(guild, id, gconf);
-        return safeReply(interaction, { embeds: [successEmbed('Giveaway ended.')], ephemeral: true });
+        return safeReply(interaction, { embeds: [successEmbed('Giveaway ended.')], flags: MessageFlags.Ephemeral });
       }
       if (sub === 'reroll') {
         const id = interaction.options.getString('messageid');
         const g = gconf.giveaways[id];
-        if (!g) return safeReply(interaction, { embeds: [errorEmbed('No giveaway found with that message ID.')], ephemeral: true });
-        if (!g.entrants.length) return safeReply(interaction, { embeds: [errorEmbed('No entrants to reroll from.')], ephemeral: true });
+        if (!g) return safeReply(interaction, { embeds: [errorEmbed('No giveaway found with that message ID.')], flags: MessageFlags.Ephemeral });
+        if (!g.entrants.length) return safeReply(interaction, { embeds: [errorEmbed('No entrants to reroll from.')], flags: MessageFlags.Ephemeral });
         const winner = g.entrants[Math.floor(Math.random() * g.entrants.length)];
         const ch = await guild.channels.fetch(g.channelId).catch(() => null);
         if (ch) ch.send({ embeds: [successEmbed(`New winner for **${g.prize}**: <@${winner}>`, '🎉 Reroll')] });
-        return safeReply(interaction, { embeds: [successEmbed('Rerolled.')], ephemeral: true });
+        return safeReply(interaction, { embeds: [successEmbed('Rerolled.')], flags: MessageFlags.Ephemeral });
       }
       break;
     }
 
-    // ---------------- STATUS MONITOR ----------------
     case 'statusmonitor': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'add') {
         const url = interaction.options.getString('url');
-        if (!/^https?:\/\//i.test(url)) return safeReply(interaction, { embeds: [errorEmbed('URL must start with http:// or https://')], ephemeral: true });
+        if (!/^https?:\/\//i.test(url)) return safeReply(interaction, { embeds: [errorEmbed('URL must start with http:// or https://')], flags: MessageFlags.Ephemeral });
         const channel = interaction.options.getChannel('channel');
         gconf.statusmonitors.push({ url, channelId: channel.id, lastStatus: null, messageId: null });
         saveDB();
@@ -2175,7 +2092,6 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- WEATHER ----------------
     case 'weather': {
       await interaction.deferReply();
       const location = interaction.options.getString('location');
@@ -2192,7 +2108,6 @@ async function handleSlash(interaction) {
       }
     }
 
-    // ---------------- QR CODE ----------------
     case 'qrcode': {
       await interaction.deferReply();
       const text = interaction.options.getString('text');
@@ -2200,17 +2115,15 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle('QR Code').setImage(url)] });
     }
 
-    // ---------------- REMINDME ----------------
     case 'remindme': {
       const durMs = parseDuration(interaction.options.getString('when'));
-      if (!durMs) return safeReply(interaction, { embeds: [errorEmbed('Invalid time format. Use e.g. 10m, 1h, 2d.')], ephemeral: true });
+      if (!durMs) return safeReply(interaction, { embeds: [errorEmbed('Invalid time format. Use e.g. 10m, 1h, 2d.')], flags: MessageFlags.Ephemeral });
       const text = interaction.options.getString('text');
       gconf.reminders.push({ userId: interaction.user.id, channelId: interaction.channel.id, remindAt: Date.now() + durMs, text, id: Date.now().toString() });
       saveDB();
-      return safeReply(interaction, { embeds: [successEmbed(`I'll remind you in ${interaction.options.getString('when')}.`)], ephemeral: true });
+      return safeReply(interaction, { embeds: [successEmbed(`I'll remind you in ${interaction.options.getString('when')}.`)], flags: MessageFlags.Ephemeral });
     }
 
-    // ---------------- POLL ----------------
     case 'poll': {
       const question = interaction.options.getString('question');
       const optionsStr = interaction.options.getString('options');
@@ -2232,7 +2145,6 @@ async function handleSlash(interaction) {
       return;
     }
 
-    // ---------------- AFK ----------------
     case 'afk': {
       const reason = interaction.options.getString('reason') || 'AFK';
       gconf.afk[interaction.user.id] = { reason, since: Date.now() };
@@ -2240,7 +2152,6 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [successEmbed(`You are now AFK: ${reason}`)] });
     }
 
-    // ---------------- INFO COMMANDS ----------------
     case 'serverinfo': {
       const owner = await guild.fetchOwner().catch(() => null);
       const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(guild.name).setThumbnail(guild.iconURL())
@@ -2285,7 +2196,7 @@ async function handleSlash(interaction) {
     }
     case 'banner': {
       const user = await client.users.fetch((interaction.options.getUser('user') || interaction.user).id, { force: true });
-      if (!user.bannerURL()) return safeReply(interaction, { embeds: [errorEmbed('This user has no banner set.')], ephemeral: true });
+      if (!user.bannerURL()) return safeReply(interaction, { embeds: [errorEmbed('This user has no banner set.')], flags: MessageFlags.Ephemeral });
       return safeReply(interaction, { embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle(`${user.tag}'s Banner`).setImage(user.bannerURL({ size: 512 }))] });
     }
     case 'membercount': {
@@ -2298,7 +2209,6 @@ async function handleSlash(interaction) {
       return interaction.editReply({ embeds: [infoEmbed(`Bot latency: **${rtt}ms**\nAPI latency: **${Math.round(client.ws.ping)}ms**`, '🏓 Pong!')] });
     }
     case 'stats': {
-      const uptime = Math.floor((Date.now() - startTime) / 1000);
       const mem = process.memoryUsage().heapUsed / 1024 / 1024;
       const embed = infoEmbed(
         `Uptime: <t:${Math.floor(startTime / 1000)}:R>\nMemory: **${mem.toFixed(1)} MB**\nServers: **${client.guilds.cache.size}**\nUsers: **${client.guilds.cache.reduce((a, g) => a + g.memberCount, 0)}**\nChannels: **${client.channels.cache.size}**\nCommands: **${commands.length}**`,
@@ -2311,15 +2221,14 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [pages[0]], components: [helpButtons(0)] });
     }
     case 'pingstatus': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       pingStatusMessages.set(guild.id, { channelId: interaction.channel.id, messageId: null });
       await pingStatusTick();
       return safeReply(interaction, { embeds: [successEmbed('Live ping status started — it will update every minute in this channel.')] });
     }
 
-    // ---------------- SERVER MANAGEMENT ----------------
     case 'autorole': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'set') {
         const role = interaction.options.getRole('role');
@@ -2330,24 +2239,24 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [successEmbed('Autorole removed.')] });
     }
     case 'stickyroles': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       gconf.stickyroles.enabled = sub === 'enable'; saveDB();
       return safeReply(interaction, { embeds: [successEmbed(`Sticky roles ${sub}d.`)] });
     }
     case 'addrole': case 'removerole': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageRoles) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Roles permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageRoles) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Roles permission.')], flags: MessageFlags.Ephemeral });
       const user = interaction.options.getUser('user');
       const role = interaction.options.getRole('role');
       const member = await guild.members.fetch(user.id).catch(() => null);
-      if (!member) return safeReply(interaction, { embeds: [errorEmbed('User not found in this server.')], ephemeral: true });
-      if (role.position >= guild.members.me.roles.highest.position) return safeReply(interaction, { embeds: [errorEmbed("I can't manage a role positioned above or equal to my highest role.")], ephemeral: true });
+      if (!member) return safeReply(interaction, { embeds: [errorEmbed('User not found in this server.')], flags: MessageFlags.Ephemeral });
+      if (role.position >= guild.members.me.roles.highest.position) return safeReply(interaction, { embeds: [errorEmbed("I can't manage a role positioned above or equal to my highest role.")], flags: MessageFlags.Ephemeral });
       if (commandName === 'addrole') await member.roles.add(role).catch(() => {});
       else await member.roles.remove(role).catch(() => {});
       return safeReply(interaction, { embeds: [successEmbed(`${role} ${commandName === 'addrole' ? 'added to' : 'removed from'} ${user}.`)] });
     }
     case 'verifyconfig': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const role = interaction.options.getRole('role');
       const channel = interaction.options.getChannel('channel');
       gconf.verification.enabled = true;
@@ -2357,21 +2266,21 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [successEmbed(`Verification configured. Run \`/verify\` to post the button in ${channel}.`)] });
     }
     case 'verify': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
-      if (!gconf.verification.enabled) return safeReply(interaction, { embeds: [errorEmbed('Run `/verifyconfig` first.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
+      if (!gconf.verification.enabled) return safeReply(interaction, { embeds: [errorEmbed('Run `/verifyconfig` first.')], flags: MessageFlags.Ephemeral });
       const ch = await guild.channels.fetch(gconf.verification.channelId).catch(() => null);
-      if (!ch) return safeReply(interaction, { embeds: [errorEmbed('Configured verification channel not found.')], ephemeral: true });
+      if (!ch) return safeReply(interaction, { embeds: [errorEmbed('Configured verification channel not found.')], flags: MessageFlags.Ephemeral });
       const embed = infoEmbed('Click the button below to verify yourself and gain access to the server.', '✅ Verification');
       const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('verify_button').setLabel('Verify').setStyle(ButtonStyle.Success));
       const msg = await ch.send({ embeds: [embed], components: [row] });
       gconf.verification.messageId = msg.id; saveDB();
-      return safeReply(interaction, { embeds: [successEmbed('Verification panel posted.')], ephemeral: true });
+      return safeReply(interaction, { embeds: [successEmbed('Verification panel posted.')], flags: MessageFlags.Ephemeral });
     }
     case 'serverstats': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'setup') {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const cats = { members: 'Members: 0', bots: 'Bots: 0', humans: 'Humans: 0', online: 'Online: 0', boosts: 'Boosts: 0' };
         for (const [key, name] of Object.entries(cats)) {
           const ch = await guild.channels.create({ name, type: ChannelType.GuildVoice, permissionOverwrites: [{ id: guild.roles.everyone, deny: [PermissionFlagsBits.Connect] }] }).catch(() => null);
@@ -2389,9 +2298,8 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [successEmbed('Server statistic channels removed.')] });
     }
 
-    // ---------------- FUN & ENGAGEMENT ----------------
     case 'starboard': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'setup') {
         gconf.starboard.enabled = true;
@@ -2404,7 +2312,7 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [successEmbed('Starboard disabled.')] });
     }
     case 'reactionrole': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'add') {
         const messageId = interaction.options.getString('messageid');
@@ -2425,7 +2333,7 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [infoEmbed(desc, 'Reaction Roles')] });
     }
     case 'autopublish': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       const channel = interaction.options.getChannel('channel');
       if (sub === 'setup') {
@@ -2437,9 +2345,8 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [successEmbed(`Auto-publish ${sub === 'setup' ? 'enabled' : 'disabled'} for ${channel}.`)] });
     }
 
-    // ---------------- APPLICATION SYSTEM ----------------
     case 'application': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'setup') {
         gconf.applications.reviewChannelId = interaction.options.getChannel('reviewchannel').id;
@@ -2447,7 +2354,7 @@ async function handleSlash(interaction) {
         return safeReply(interaction, { embeds: [successEmbed('Applications will now be reviewed in that channel.')] });
       }
       if (sub === 'panel') {
-        if (!gconf.applications.reviewChannelId) return safeReply(interaction, { embeds: [errorEmbed('Run `/application setup` first.')], ephemeral: true });
+        if (!gconf.applications.reviewChannelId) return safeReply(interaction, { embeds: [errorEmbed('Run `/application setup` first.')], flags: MessageFlags.Ephemeral });
         const title = interaction.options.getString('title');
         const description = interaction.options.getString('description');
         const banner = interaction.options.getString('banner');
@@ -2458,17 +2365,17 @@ async function handleSlash(interaction) {
         const panelId = gconf.applications.nextPanelId++;
         gconf.applications.panels[panelId] = { channelId: interaction.channel.id, messageId: msg.id, title, description, banner: banner || null };
         saveDB();
-        return safeReply(interaction, { embeds: [successEmbed(`Application panel #${panelId} posted.`)], ephemeral: true });
+        return safeReply(interaction, { embeds: [successEmbed(`Application panel #${panelId} posted.`)], flags: MessageFlags.Ephemeral });
       }
       if (sub === 'addquestion') {
-        if (gconf.applications.questions.length >= 5) return safeReply(interaction, { embeds: [errorEmbed('Maximum of 5 questions (Discord modal limit).')], ephemeral: true });
+        if (gconf.applications.questions.length >= 5) return safeReply(interaction, { embeds: [errorEmbed('Maximum of 5 questions (Discord modal limit).')], flags: MessageFlags.Ephemeral });
         gconf.applications.questions.push(interaction.options.getString('question'));
         saveDB();
         return safeReply(interaction, { embeds: [successEmbed('Question added.')] });
       }
       if (sub === 'removequestion') {
         const num = interaction.options.getInteger('number');
-        if (num < 1 || num > gconf.applications.questions.length) return safeReply(interaction, { embeds: [errorEmbed('Invalid question number.')], ephemeral: true });
+        if (num < 1 || num > gconf.applications.questions.length) return safeReply(interaction, { embeds: [errorEmbed('Invalid question number.')], flags: MessageFlags.Ephemeral });
         gconf.applications.questions.splice(num - 1, 1);
         saveDB();
         return safeReply(interaction, { embeds: [successEmbed('Question removed.')] });
@@ -2488,9 +2395,8 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- AI CONFIG (Super Admin only) ----------------
     case 'aiconfig': {
-      if (!requireLevel(interaction, gconf, LEVEL.SUPER_ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Super Admin or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.SUPER_ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Super Admin or higher.')], flags: MessageFlags.Ephemeral });
       const sub = interaction.options.getSubcommand();
       if (sub === 'setprompt') {
         gconf.ai.customPrompt = interaction.options.getString('prompt').slice(0, 2000);
@@ -2515,9 +2421,8 @@ async function handleSlash(interaction) {
       break;
     }
 
-    // ---------------- ANNOUNCEMENT ----------------
     case 'announcement': {
-      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
       const channel = interaction.options.getChannel('channel');
       const title = interaction.options.getString('title');
       const messageText = interaction.options.getString('message');
@@ -2528,13 +2433,13 @@ async function handleSlash(interaction) {
       if (banner) embed.setImage(banner);
       const content = ping === 'everyone' ? '@everyone' : ping === 'here' ? '@here' : undefined;
       const sent = await channel.send({ content, embeds: [embed] }).catch(() => null);
-      if (!sent) return safeReply(interaction, { embeds: [errorEmbed('Could not send the announcement (check my permissions in that channel).')], ephemeral: true });
+      if (!sent) return safeReply(interaction, { embeds: [errorEmbed('Could not send the announcement (check my permissions in that channel).')], flags: MessageFlags.Ephemeral });
       if (channel.type === ChannelType.GuildAnnouncement) sent.crosspost().catch(() => {});
-      return safeReply(interaction, { embeds: [successEmbed(`Announcement posted in ${channel}.`)], ephemeral: true });
+      return safeReply(interaction, { embeds: [successEmbed(`Announcement posted in ${channel}.`)], flags: MessageFlags.Ephemeral });
     }
 
     default:
-      return safeReply(interaction, { embeds: [errorEmbed('Unknown command.')], ephemeral: true });
+      return safeReply(interaction, { embeds: [errorEmbed('Unknown command.')], flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -2547,7 +2452,7 @@ async function handleTicketCommand(interaction, gconf) {
   const adminSubs = ['setup', 'panel', 'panels', 'editpanel', 'deletepanel', 'closeall', 'addtype', 'listtypes', 'edittype', 'deletetype', 'config'];
 
   if (adminSubs.includes(sub) && !requireLevel(interaction, gconf, LEVEL.ADMIN)) {
-    return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+    return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], flags: MessageFlags.Ephemeral });
   }
 
   if (sub === 'setup') {
@@ -2559,7 +2464,7 @@ async function handleTicketCommand(interaction, gconf) {
     return safeReply(interaction, { embeds: [successEmbed('Ticket system configured.')] });
   }
   if (sub === 'panel') {
-    if (!gconf.tickets.categoryId) return safeReply(interaction, { embeds: [errorEmbed('Run `/ticket setup` first.')], ephemeral: true });
+    if (!gconf.tickets.categoryId) return safeReply(interaction, { embeds: [errorEmbed('Run `/ticket setup` first.')], flags: MessageFlags.Ephemeral });
     const title = interaction.options.getString('title');
     const description = interaction.options.getString('description');
     const banner = interaction.options.getString('banner');
@@ -2579,7 +2484,7 @@ async function handleTicketCommand(interaction, gconf) {
     const panelId = gconf.tickets.nextPanelId++;
     gconf.tickets.panels[panelId] = { channelId: interaction.channel.id, messageId: msg.id, title, description, banner: banner || null };
     saveDB();
-    return safeReply(interaction, { embeds: [successEmbed(`Panel #${panelId} posted.`)], ephemeral: true });
+    return safeReply(interaction, { embeds: [successEmbed(`Panel #${panelId} posted.`)], flags: MessageFlags.Ephemeral });
   }
   if (sub === 'panels') {
     const entries = Object.entries(gconf.tickets.panels);
@@ -2589,7 +2494,7 @@ async function handleTicketCommand(interaction, gconf) {
   if (sub === 'editpanel') {
     const id = interaction.options.getInteger('id');
     const panel = gconf.tickets.panels[id];
-    if (!panel) return safeReply(interaction, { embeds: [errorEmbed('Panel not found.')], ephemeral: true });
+    if (!panel) return safeReply(interaction, { embeds: [errorEmbed('Panel not found.')], flags: MessageFlags.Ephemeral });
     const title = interaction.options.getString('title') || panel.title;
     const description = interaction.options.getString('description') || panel.description;
     const banner = interaction.options.getString('banner') || panel.banner;
@@ -2605,14 +2510,14 @@ async function handleTicketCommand(interaction, gconf) {
   if (sub === 'deletepanel') {
     const id = interaction.options.getInteger('id');
     const panel = gconf.tickets.panels[id];
-    if (!panel) return safeReply(interaction, { embeds: [errorEmbed('Panel not found.')], ephemeral: true });
+    if (!panel) return safeReply(interaction, { embeds: [errorEmbed('Panel not found.')], flags: MessageFlags.Ephemeral });
     const ch = await guild.channels.fetch(panel.channelId).catch(() => null);
     if (ch) { const msg = await ch.messages.fetch(panel.messageId).catch(() => null); if (msg) msg.delete().catch(() => {}); }
     delete gconf.tickets.panels[id]; saveDB();
     return safeReply(interaction, { embeds: [successEmbed(`Panel #${id} deleted.`)] });
   }
   if (sub === 'closeall') {
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const openRows = ticketDB.allOpenByGuild.all(guild.id);
     let count = 0;
     for (const row of openRows) {
@@ -2635,7 +2540,7 @@ async function handleTicketCommand(interaction, gconf) {
   }
   if (sub === 'edittype') {
     const name = interaction.options.getString('name');
-    if (!gconf.tickets.types[name]) return safeReply(interaction, { embeds: [errorEmbed('Type not found.')], ephemeral: true });
+    if (!gconf.tickets.types[name]) return safeReply(interaction, { embeds: [errorEmbed('Type not found.')], flags: MessageFlags.Ephemeral });
     gconf.tickets.types[name].emoji = interaction.options.getString('emoji');
     saveDB();
     return safeReply(interaction, { embeds: [successEmbed(`Type **${name}** updated.`)] });
@@ -2649,23 +2554,22 @@ async function handleTicketCommand(interaction, gconf) {
     return safeReply(interaction, { embeds: [configSummaryEmbed(gconf, 'tickets', guild.id)] });
   }
 
-  // ---- ticket-channel-scoped subcommands (backed by SQLite) ----
   const ticketRow = ticketDB.getOpenByChannel.get(interaction.channel.id);
 
   if (sub === 'add' || sub === 'remove') {
-    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], flags: MessageFlags.Ephemeral });
     const user = interaction.options.getUser('user');
     if (sub === 'add') await interaction.channel.permissionOverwrites.edit(user.id, { ViewChannel: true, SendMessages: true });
     else await interaction.channel.permissionOverwrites.delete(user.id);
     return safeReply(interaction, { embeds: [successEmbed(`${user} ${sub === 'add' ? 'added to' : 'removed from'} the ticket.`)] });
   }
   if (sub === 'claim') {
-    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], flags: MessageFlags.Ephemeral });
     ticketDB.claim.run(interaction.user.id, interaction.channel.id);
     return safeReply(interaction, { embeds: [successEmbed(`Ticket claimed by ${interaction.user}.`)] });
   }
   if (sub === 'close') {
-    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], flags: MessageFlags.Ephemeral });
     await safeReply(interaction, { embeds: [warnEmbed('Closing this ticket in 5 seconds...')] });
     const logCh = gconf.tickets.logChannel ? await guild.channels.fetch(gconf.tickets.logChannel).catch(() => null) : null;
     if (logCh) logCh.send({ embeds: [infoEmbed(`Ticket <#${interaction.channel.id}> closed by ${interaction.user}.`, '🎫 Ticket Closed')] }).catch(() => {});
@@ -2674,14 +2578,13 @@ async function handleTicketCommand(interaction, gconf) {
     return;
   }
   if (sub === 'transcript') {
-    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     const rows = ticketDB.getTranscript.all(interaction.channel.id);
     let lines;
     if (rows.length) {
       lines = rows.map(r => `[${new Date(r.created_at).toISOString()}] ${r.author_tag}: ${r.content}${r.attachments ? ' ' + r.attachments : ''}`);
     } else {
-      // fallback: pull directly from the channel if no live-logged rows exist yet
       const messages = await interaction.channel.messages.fetch({ limit: 100 });
       const sorted = [...messages.values()].reverse();
       lines = sorted.map(m => `[${m.createdAt.toISOString()}] ${m.author.tag}: ${m.content}${m.attachments.size ? ' ' + [...m.attachments.values()].map(a => a.url).join(' ') : ''}`);
@@ -2697,16 +2600,15 @@ async function handleTicketCommand(interaction, gconf) {
   }
 }
 
-
 // ---------------------------------------------------------------------------
-// TICKET CREATION HELPER (shared by button + select menu)
+// TICKET CREATION HELPER
 // ---------------------------------------------------------------------------
 async function createTicket(interaction, gconf, type = 'general') {
   const guild = interaction.guild;
-  if (!gconf.tickets.categoryId) return safeReply(interaction, { embeds: [errorEmbed('Ticket system is not configured yet.')], ephemeral: true });
+  if (!gconf.tickets.categoryId) return safeReply(interaction, { embeds: [errorEmbed('Ticket system is not configured yet.')], flags: MessageFlags.Ephemeral });
 
   const openForUser = (ticketDB.countOpenByUser.get(guild.id, interaction.user.id) || { c: 0 }).c;
-  if (openForUser >= 3) return safeReply(interaction, { embeds: [errorEmbed('You already have the maximum number of open tickets (3).')], ephemeral: true });
+  if (openForUser >= 3) return safeReply(interaction, { embeds: [errorEmbed('You already have the maximum number of open tickets (3).')], flags: MessageFlags.Ephemeral });
 
   const overwrites = [
     { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
@@ -2724,7 +2626,7 @@ async function createTicket(interaction, gconf, type = 'general') {
     permissionOverwrites: overwrites,
   }).catch(() => null);
 
-  if (!channel) return safeReply(interaction, { embeds: [errorEmbed('Failed to create ticket channel (check my permissions/category).')], ephemeral: true });
+  if (!channel) return safeReply(interaction, { embeds: [errorEmbed('Failed to create ticket channel (check my permissions/category).')], flags: MessageFlags.Ephemeral });
 
   ticketDB.create.run(channel.id, guild.id, interaction.user.id, type, Date.now());
 
@@ -2739,7 +2641,7 @@ async function createTicket(interaction, gconf, type = 'general') {
   const logCh = gconf.tickets.logChannel ? await guild.channels.fetch(gconf.tickets.logChannel).catch(() => null) : null;
   if (logCh) logCh.send({ embeds: [infoEmbed(`New ticket <#${channel.id}> opened by ${interaction.user} (${type}).`, '🎫 Ticket Opened')] }).catch(() => {});
 
-  return safeReply(interaction, { embeds: [successEmbed(`Ticket created: ${channel}`)], ephemeral: true });
+  return safeReply(interaction, { embeds: [successEmbed(`Ticket created: ${channel}`)], flags: MessageFlags.Ephemeral });
 }
 
 // ---------------------------------------------------------------------------
@@ -2759,13 +2661,13 @@ async function handleButton(interaction) {
 
   if (id === 'ticket_claim') {
     const ticketRow = ticketDB.getOpenByChannel.get(interaction.channel.id);
-    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], flags: MessageFlags.Ephemeral });
     ticketDB.claim.run(interaction.user.id, interaction.channel.id);
     return safeReply(interaction, { embeds: [successEmbed(`Claimed by ${interaction.user}.`)] });
   }
   if (id === 'ticket_close') {
     const ticketRow = ticketDB.getOpenByChannel.get(interaction.channel.id);
-    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], flags: MessageFlags.Ephemeral });
     await safeReply(interaction, { embeds: [warnEmbed('Closing this ticket in 5 seconds...')] });
     const logCh = gconf.tickets.logChannel ? await interaction.guild.channels.fetch(gconf.tickets.logChannel).catch(() => null) : null;
     if (logCh) logCh.send({ embeds: [infoEmbed(`Ticket <#${interaction.channel.id}> closed by ${interaction.user}.`, '🎫 Ticket Closed')] }).catch(() => {});
@@ -2775,29 +2677,29 @@ async function handleButton(interaction) {
   }
 
   if (id === 'verify_button') {
-    if (!gconf.verification.enabled) return safeReply(interaction, { embeds: [errorEmbed('Verification is not configured.')], ephemeral: true });
+    if (!gconf.verification.enabled) return safeReply(interaction, { embeds: [errorEmbed('Verification is not configured.')], flags: MessageFlags.Ephemeral });
     const role = interaction.guild.roles.cache.get(gconf.verification.roleId);
-    if (!role) return safeReply(interaction, { embeds: [errorEmbed('Configured role not found.')], ephemeral: true });
+    if (!role) return safeReply(interaction, { embeds: [errorEmbed('Configured role not found.')], flags: MessageFlags.Ephemeral });
     await interaction.member.roles.add(role).catch(() => {});
-    return safeReply(interaction, { embeds: [successEmbed('You are now verified!')], ephemeral: true });
+    return safeReply(interaction, { embeds: [successEmbed('You are now verified!')], flags: MessageFlags.Ephemeral });
   }
 
   if (id === 'giveaway_enter') {
     const g = gconf.giveaways[interaction.message.id];
-    if (!g || g.ended) return safeReply(interaction, { embeds: [errorEmbed('This giveaway has ended.')], ephemeral: true });
+    if (!g || g.ended) return safeReply(interaction, { embeds: [errorEmbed('This giveaway has ended.')], flags: MessageFlags.Ephemeral });
     if (g.entrants.includes(interaction.user.id)) {
       g.entrants = g.entrants.filter(id2 => id2 !== interaction.user.id);
       saveDB();
-      return safeReply(interaction, { embeds: [infoEmbed('You left the giveaway.')], ephemeral: true });
+      return safeReply(interaction, { embeds: [infoEmbed('You left the giveaway.')], flags: MessageFlags.Ephemeral });
     }
     g.entrants.push(interaction.user.id);
     saveDB();
-    return safeReply(interaction, { embeds: [successEmbed('You entered the giveaway! Click again to leave.')], ephemeral: true });
+    return safeReply(interaction, { embeds: [successEmbed('You entered the giveaway! Click again to leave.')], flags: MessageFlags.Ephemeral });
   }
 
   if (id === 'application_apply') {
     if (gconf.applications.pendingByUser[interaction.user.id]) {
-      return safeReply(interaction, { embeds: [errorEmbed('You already have a pending application. Please wait for a response.')], ephemeral: true });
+      return safeReply(interaction, { embeds: [errorEmbed('You already have a pending application. Please wait for a response.')], flags: MessageFlags.Ephemeral });
     }
     const questions = gconf.applications.questions.length ? gconf.applications.questions : ['Why do you want to join?', 'Relevant experience?'];
     const modal = new ModalBuilder().setCustomId('application_modal').setTitle('Application Form');
@@ -2810,7 +2712,7 @@ async function handleButton(interaction) {
   }
 
   if (id.startsWith('application_accept_') || id.startsWith('application_deny_')) {
-    if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+    if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], flags: MessageFlags.Ephemeral });
     const accepted = id.startsWith('application_accept_');
     const userId = id.replace(accepted ? 'application_accept_' : 'application_deny_', '');
     const record = gconf.applications.submissions.find(s => s.userId === userId && s.status === 'pending');
@@ -2837,7 +2739,7 @@ async function handleButton(interaction) {
     return;
   }
 
-  if (id.startsWith('botconfig_')) return; // handled in select
+  if (id.startsWith('botconfig_')) return;
 }
 
 // ---------------------------------------------------------------------------
@@ -2882,89 +2784,53 @@ async function handleModal(interaction) {
     const reviewCh = gconf.applications.reviewChannelId ? await interaction.guild.channels.fetch(gconf.applications.reviewChannelId).catch(() => null) : null;
     if (reviewCh) await reviewCh.send({ embeds: [embed], components: [row] }).catch(() => {});
 
-    return safeReply(interaction, { embeds: [successEmbed('Your application has been submitted for review!')], ephemeral: true });
+    return safeReply(interaction, { embeds: [successEmbed('Your application has been submitted for review!')], flags: MessageFlags.Ephemeral });
   }
 
-  return safeReply(interaction, { embeds: [infoEmbed('Received.')], ephemeral: true });
+  return safeReply(interaction, { embeds: [infoEmbed('Received.')], flags: MessageFlags.Ephemeral });
 }
 
 // ---------------------------------------------------------------------------
-// STARTUP / ERROR HANDLING
+// GLOBAL ERROR HANDLING
 // ---------------------------------------------------------------------------
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
-  flushDBSync();
-});
+process.on('uncaughtException', (err) => { console.error('Uncaught Exception:', err); flushDBSync(); });
+process.on('unhandledRejection', (err) => { console.error('Unhandled Rejection:', err); flushDBSync(); });
 
-process.on('unhandledRejection', (err) => {
-  console.error('Unhandled Rejection:', err);
-  flushDBSync();
-});
-
+// ---------------------------------------------------------------------------
+// KEEP-ALIVE WEB SERVER
+// ---------------------------------------------------------------------------
 const app = express();
-const port = Number(process.env.PORT || 3000);
-
 app.get('/', (req, res) => res.send('Bot is alive.'));
-app.get('/health', (req, res) => res.json({
-  status: client.isReady() ? 'discord-online' : 'discord-connecting',
-  uptime: process.uptime(),
-  guilds: client.guilds.cache.size,
-}));
+app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime(), guilds: client.guilds.cache.size }));
+app.listen(process.env.PORT || 3000, () => console.log(`Web server listening on port ${process.env.PORT || 3000}`));
 
-app.listen(port, () => {
-  console.log(`Web server listening on port ${port}`);
-});
+// ---------------------------------------------------------------------------
+// LOGIN (with retry/backoff so a transient gateway timeout doesn't kill the
+// process on the first try)
+// ---------------------------------------------------------------------------
+async function loginWithRetry(maxAttempts = 5) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(`Starting Discord login (attempt ${attempt}/${maxAttempts})...`);
+    try {
+      await client.login(process.env.DISCORD_TOKEN);
+      console.log('Discord login completed.');
+      return;
+    } catch (err) {
+      console.error(`Login attempt ${attempt} failed:`, err?.message || err);
+      if (attempt === maxAttempts) {
+        console.error('All login attempts failed. Check DISCORD_TOKEN, privileged intents, and https://discordstatus.com.');
+        process.exit(1);
+      }
+      const delayMs = 5000 * attempt;
+      console.log(`Retrying in ${delayMs / 1000}s...`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
 
-client.on('clientReady', () => {
-  console.log(`✅ Discord bot online as ${client.user.tag}`);
-});
-
-client.on('error', (error) => {
-  console.error('Discord client error:', error);
-});
-
-client.on('shardError', (error) => {
-  console.error('Discord shard error:', error);
-});
-
-client.on('warn', (warning) => {
-  console.warn('Discord warning:', warning);
-});
-
-const token = String(
-  process.env.DISCORD_TOKEN ||
-  process.env.DISCORD_BOT_TOKEN ||
-  '',
-).trim();
-
-if (!token) {
-  console.error('❌ DISCORD_TOKEN is missing.');
-  console.error('Add DISCORD_TOKEN to your hosting provider environment variables.');
+if (!process.env.DISCORD_TOKEN) {
+  console.error('DISCORD_TOKEN is not set. Add it in your environment variables before starting the bot.');
   process.exit(1);
 }
 
-console.log('Starting Discord login...');
-
-const loginTimeout = setTimeout(() => {
-  if (!client.isReady()) {
-    console.error('❌ Discord login timed out after 45 seconds.');
-    console.error('Check the bot token, network access, and Discord gateway status.');
-    process.exit(1);
-  }
-}, 45_000);
-
-client.login(token)
-  .then(() => {
-    clearTimeout(loginTimeout);
-    console.log('Discord login completed.');
-  })
-  .catch((error) => {
-    clearTimeout(loginTimeout);
-    console.error('❌ Discord login failed.');
-    console.error({
-      name: error?.name,
-      code: error?.code,
-      message: error?.message,
-    });
-    process.exit(1);
-  });
+loginWithRetry();
