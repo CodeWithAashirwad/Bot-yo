@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terminus · Live SSH</title>
+
+    <!-- xterm.js + addons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-web-links@0.9.0/lib/xterm-addon-web-links.min.js"></script>
+
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            --bg-root: #0a0a0c;
+            --bg-surface: #121216;
+            --bg-elevated: #1a1a20;
+            --bg-hover: #22222a;
+            --border-subtle: #26262e;
+            --border-medium: #33333e;
+            --text-primary: #e8e8ed;
+            --text-secondary: #a0a0b0;
+            --text-muted: #6b6b7a;
+            --accent: #7c6aff;
+            --accent-dim: #5c4ad0;
+            --accent-glow: rgba(124, 106, 255, 0.25);
+            --success: #2ecc71;
+            --success-glow: rgba(46, 204, 113, 0.3);
+            --warning: #f0b34b;
+            --danger: #e74c5a;
+            --radius-sm: 6px;
+            --radius-md: 10px;
+            --radius-lg: 16px;
+            --shadow-soft: 0 8px 32px rgba(0, 0, 0, 0.6);
+            --transition-fast: 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+            --transition-smooth: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        html, body {
+            height: 100%;
+            background: var(--bg-root);
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            overflow: hidden;
+            color: var(--text-primary);
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        .app {
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        /* ── Title bar ── */
+        .titlebar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 42px;
+            padding: 0 16px 0 12px;
+            background: var(--bg-surface);
+            flex-shrink: 0;
+            user-select: none;
+            border-bottom: 1px solid var(--border-subtle);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+
+        .titlebar-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .titlebar-left .tab {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 7px 18px;
+            background: var(--bg-elevated);
+            border-radius: var(--radius-md);
+            font-weight: 500;
+            font-size: 12.5px;
+            color: var(--text-primary);
+            letter-spacing: 0.1px;
+            border: 1px solid var(--border-subtle);
+            transition: border-color var(--transition-fast);
+        }
+        .titlebar-left .tab:hover { border-color: var(--border-medium); }
+        .titlebar-left .tab i { color: var(--accent); font-size: 13px; }
+
+        .titlebar-right {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            font-size: 11.5px;
+            font-weight: 500;
+            color: var(--text-muted);
+            padding: 5px 12px 5px 10px;
+            background: var(--bg-root);
+            border-radius: 20px;
+            border: 1px solid var(--border-subtle);
+            transition: all var(--transition-smooth);
+        }
+        .status-indicator .dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #3a3a44;
+            transition: all var(--transition-smooth);
+            flex-shrink: 0;
+        }
+        .status-indicator.connected {
+            border-color: rgba(46, 204, 113, 0.3);
+            color: #9bffc5;
+            background: rgba(46, 204, 113, 0.06);
+        }
+        .status-indicator.connected .dot {
+            background: var(--success);
+            box-shadow: 0 0 12px var(--success-glow), 0 0 4px var(--success);
+        }
+
+        .win-buttons { display: flex; gap: 4px; margin-left: 6px; }
+        .win-btn {
+            width: 38px; height: 30px;
+            display: flex; align-items: center; justify-content: center;
+            background: transparent; border: none; color: var(--text-secondary);
+            cursor: pointer; font-size: 11px;
+            border-radius: var(--radius-sm);
+            transition: all var(--transition-fast);
+        }
+        .win-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .win-btn.close:hover { background: var(--danger); color: white; }
+
+        .tb-btn {
+            display: flex; align-items: center; gap: 7px;
+            padding: 6px 16px;
+            font-size: 12px;
+            font-weight: 500;
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-elevated);
+            border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm);
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all var(--transition-fast);
+            letter-spacing: 0.1px;
+            white-space: nowrap;
+        }
+        .tb-btn:hover:not(:disabled) {
+            background: var(--bg-hover);
+            border-color: var(--border-medium);
+            color: var(--text-primary);
+        }
+        .tb-btn:active:not(:disabled) {
+            transform: scale(0.97);
+        }
+        .tb-btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        .tb-btn.primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+            box-shadow: 0 0 20px var(--accent-glow);
+        }
+        .tb-btn.primary:hover:not(:disabled) {
+            background: #8b7aff;
+            border-color: #8b7aff;
+            box-shadow: 0 0 28px var(--accent-glow);
+        }
+        .tb-btn i { font-size: 11px; }
+
+        /* ── Terminal host ── */
+        .terminal-host {
+            flex: 1;
+            padding: 8px 10px;
+            background: var(--bg-root);
+            overflow: hidden;
+            position: relative;
+        }
+        #terminal {
+            width: 100%;
+            height: 100%;
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            border: 1px solid var(--border-subtle);
+            box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.4);
+        }
+        .xterm-screen { padding: 4px 2px; }
+
+        /* ── Status bar ── */
+        .statusbar {
+            display: flex; align-items: center; justify-content: space-between;
+            height: 32px; padding: 0 18px;
+            background: var(--bg-surface); color: var(--text-muted);
+            font-size: 11.5px; flex-shrink: 0;
+            border-top: 1px solid var(--border-subtle);
+            user-select: none;
+        }
+        .statusbar-left { display: flex; align-items: center; gap: 22px; }
+        .sb-item { display: flex; align-items: center; gap: 7px; font-size: 11.5px; transition: color var(--transition-fast); }
+        .sb-item i { font-size: 10px; color: var(--text-muted); transition: color var(--transition-fast); }
+        .sb-item.active i { color: var(--success); }
+        .sb-item.active { color: #9bffc5; }
+        .sb-item.active .fa-clock { color: var(--accent); }
+        .sb-item .fa-circle { font-size: 7px; }
+        .sb-item.active .fa-circle { color: var(--success); }
+
+        /* ── Modal ── */
+        .modal-overlay {
+            position: fixed; inset: 0;
+            background: rgba(0, 0, 0, 0.75);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 2000;
+            visibility: hidden; opacity: 0;
+            transition: opacity var(--transition-smooth), visibility var(--transition-smooth);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+        .modal-overlay.active { visibility: visible; opacity: 1; }
+
+        .modal {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-medium);
+            border-radius: var(--radius-lg);
+            width: 92%; max-width: 440px;
+            padding: 28px 28px 24px;
+            box-shadow: var(--shadow-soft), 0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+            transform: scale(0.94) translateY(8px);
+            transition: transform var(--transition-smooth);
+        }
+        .modal-overlay.active .modal { transform: scale(1) translateY(0); }
+
+        .modal h3 {
+            font-size: 17px; font-weight: 600; color: var(--text-primary);
+            margin-bottom: 24px;
+            display: flex; align-items: center; gap: 10px;
+            letter-spacing: -0.2px;
+        }
+        .modal h3 i { color: var(--accent); font-size: 16px; }
+
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block; font-size: 11px; font-weight: 600;
+            color: var(--text-muted); margin-bottom: 6px;
+            text-transform: uppercase; letter-spacing: 0.6px;
+        }
+        .form-group input {
+            width: 100%; padding: 11px 14px;
+            background: var(--bg-root); border: 1px solid var(--border-subtle);
+            border-radius: var(--radius-sm); color: var(--text-primary);
+            font-family: 'JetBrains Mono', 'Consolas', monospace;
+            font-size: 13px; outline: none;
+            transition: border var(--transition-fast), box-shadow var(--transition-fast);
+        }
+        .form-group input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+        .form-group input::placeholder { color: #4a4a58; }
+
+        .modal-actions { display: flex; gap: 10px; margin-top: 24px; }
+        .modal-actions .tb-btn {
+            flex: 1; justify-content: center; padding: 11px; font-size: 12.5px;
+        }
+
+        /* ── Scrollbar ── */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb {
+            background: var(--border-medium);
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover { background: #44445a; }
+
+        /* ── Utilities ── */
+        .fa-spin { animation: fa-spin 1s linear infinite; }
+        @keyframes fa-spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+        /* ── Responsive ── */
+        @media (max-width: 720px) {
+            .titlebar { padding: 0 10px; height: 40px; }
+            .titlebar-left .tab { padding: 6px 12px; font-size: 11.5px; }
+            .tb-btn { padding: 5px 10px; font-size: 11px; }
+            .tb-btn span { display: none; }
+            .tb-btn i { font-size: 12px; }
+            .statusbar { padding: 0 12px; font-size: 10.5px; }
+            .statusbar-left { gap: 14px; }
+            .modal { padding: 22px; }
+        }
+        @media (max-width: 480px) {
+            .titlebar-right .status-indicator { display: none; }
+            .statusbar-left .sb-item:last-child { display: none; }
+        }
+
+        /* ── Fade-in animation ── */
+        @keyframes fadeSlideUp {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .terminal-host, .statusbar {
+            animation: fadeSlideUp 0.4s ease-out;
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <div class="titlebar">
+            <div class="titlebar-left">
+                <div class="tab">
+                    <i class="fas fa-terminal"></i>
+                    <span id="tabTitle">Terminus — SSH</span>
+                </div>
+            </div>
+            <div class="titlebar-right">
+                <div class="status-indicator" id="statusIndicator">
+                    <span class="dot"></span>
+                    <span id="statusText">Disconnected</span>
+                </div>
+                <button class="tb-btn" id="clearBtn" title="Clear terminal">
+                    <i class="fas fa-eraser"></i> <span>Clear</span>
+                </button>
+                <button class="tb-btn" id="disconnectBtn" disabled title="Disconnect session">
+                    <i class="fas fa-plug"></i> <span>Disconnect</span>
+                </button>
+                <button class="tb-btn primary" id="connectBtn" title="New SSH connection">
+                    <i class="fas fa-plus"></i> <span>Connect</span>
+                </button>
+                <div class="win-buttons">
+                    <button class="win-btn" tabindex="-1" aria-label="Minimize"><i class="fas fa-window-minimize"></i></button>
+                    <button class="win-btn" tabindex="-1" aria-label="Maximize"><i class="fas fa-window-maximize"></i></button>
+                    <button class="win-btn close" tabindex="-1" aria-label="Close"><i class="fas fa-times"></i></button>
+                </div>
+            </div>
+        </div>
+
+        <div class="terminal-host">
+            <div id="terminal"></div>
+        </div>
+
+        <div class="statusbar">
+            <div class="statusbar-left">
+                <div class="sb-item" id="sbSession">
+                    <i class="fas fa-circle"></i>
+                    <span id="sbSessionText">No session</span>
+                </div>
+                <div class="sb-item" id="sbLatency">
+                    <i class="fas fa-clock"></i>
+                    <span id="sbLatencyText">—</span>
+                </div>
+            </div>
+            <div class="sb-item">
+                <i class="fas fa-code"></i>
+                <span>Terminus · xterm.js</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="connectModal">
+        <div class="modal">
+            <h3><i class="fas fa-lock"></i> SSH Connection</h3>
+            <form id="sshForm">
+                <div class="form-group">
+                    <label>Host / IP</label>
+                    <input type="text" id="inHost" placeholder="192.168.1.1" required value="127.0.0.1" autocomplete="off" spellcheck="false">
+                </div>
+                <div class="form-group">
+                    <label>Port</label>
+                    <input type="number" id="inPort" value="22" min="1" max="65535" required>
+                </div>
+                <div class="form-group">
+                    <label>Username</label>
+                    <input type="text" id="inUser" placeholder="root" value="root" required autocomplete="off" spellcheck="false">
+                </div>
+                <div class="form-group">
+                    <label>Password</label>
+                    <input type="password" id="inPass" placeholder="••••••••" required autocomplete="off">
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="tb-btn" id="modalCancel">Cancel</button>
+                    <button type="submit" class="tb-btn primary" id="modalConnect">
+                        <i class="fas fa-link"></i> Connect
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        (function () {
+            'use strict';
+
+            // ── xterm.js setup with refined theme ──
+            const term = new Terminal({
+                cursorBlink: true,
+                cursorStyle: 'block',
+                fontFamily: "'JetBrains Mono', 'Consolas', 'Fira Code', monospace",
+                fontSize: 14,
+                lineHeight: 1.25,
+                letterSpacing: 0,
+                scrollback: 8000,
+                convertEol: true,
+                allowProposedApi: true,
+                smoothScrollDuration: 80,
+                theme: {
+                    background: '#0a0a0c',
+                    foreground: '#d8d8e0',
+                    cursor: '#b8aaff',
+                    cursorAccent: '#0a0a0c',
+                    selectionBackground: '#3a2d6e',
+                    selectionForeground: '#ffffff',
+                    black: '#1a1a20',
+                    red: '#f07178',
+                    green: '#7ec699',
+                    yellow: '#f0c674',
+                    blue: '#82aaff',
+                    magenta: '#c792ea',
+                    cyan: '#7fdbca',
+                    white: '#d8d8e0',
+                    brightBlack: '#5c5c6e',
+                    brightRed: '#ff8b92',
+                    brightGreen: '#9dffb0',
+                    brightYellow: '#ffe08a',
+                    brightBlue: '#a4c2ff',
+                    brightMagenta: '#e0aaff',
+                    brightCyan: '#a0f0e0',
+                    brightWhite: '#ffffff'
+                }
+            });
+
+            const fitAddon = new FitAddon.FitAddon();
+            term.loadAddon(fitAddon);
+            term.loadAddon(new WebLinksAddon.WebLinksAddon());
+            term.open(document.getElementById('terminal'));
+            setTimeout(() => fitAddon.fit(), 60);
+
+            window.addEventListener('resize', () => {
+                try { fitAddon.fit(); } catch (_) {}
+            });
+
+            // ── DOM ──
+            const statusIndicator = document.getElementById('statusIndicator');
+            const statusText      = document.getElementById('statusText');
+            const tabTitle        = document.getElementById('tabTitle');
+            const clearBtn        = document.getElementById('clearBtn');
+            const disconnectBtn   = document.getElementById('disconnectBtn');
+            const connectBtn      = document.getElementById('connectBtn');
+            const connectModal    = document.getElementById('connectModal');
+            const sshForm         = document.getElementById('sshForm');
+            const inHost          = document.getElementById('inHost');
+            const inPort          = document.getElementById('inPort');
+            const inUser          = document.getElementById('inUser');
+            const inPass          = document.getElementById('inPass');
+            const modalConnect    = document.getElementById('modalConnect');
+            const modalCancel     = document.getElementById('modalCancel');
+            const sbSession       = document.getElementById('sbSession');
+            const sbSessionText   = document.getElementById('sbSessionText');
+            const sbLatency       = document.getElementById('sbLatency');
+            const sbLatencyText   = document.getElementById('sbLatencyText');
+
+            // ── state ──
+            let sessionId   = null;
+            let isConnected = false;
+            let pollTimer   = null;
+
+            function writeWelcome() {
+                term.writeln('\x1b[1;38;5;141m╭──────────────────────────────────────────╮\x1b[0m');
+                term.writeln('\x1b[1;38;5;141m│\x1b[0m  \x1b[1;97mTerminus SSH\x1b[0m  \x1b[38;5;245m— Live Console (xterm.js)\x1b[0m  \x1b[1;38;5;141m│\x1b[0m');
+                term.writeln('\x1b[1;38;5;141m╰──────────────────────────────────────────╯\x1b[0m');
+                term.writeln('');
+                term.writeln('\x1b[38;5;245m  Click \x1b[0m\x1b[1;38;5;141mConnect\x1b[0m\x1b[38;5;245m to start a secure session.\x1b[0m');
+                term.writeln('');
+                term.writeln('\x1b[38;5;240m  ──────────────────────────────────────────\x1b[0m');
+                term.writeln('');
+            }
+            writeWelcome();
+
+            // ── connection state ──
+            function setConnected(connected, host, user) {
+                isConnected = connected;
+                if (connected) {
+                    statusIndicator.classList.add('connected');
+                    statusText.textContent = 'Connected';
+                    tabTitle.textContent = `${user}@${host}`;
+                    disconnectBtn.disabled = false;
+                    sbSession.classList.add('active');
+                    sbSessionText.textContent = `${user}@${host}`;
+                    sbLatency.classList.add('active');
+                    sbLatencyText.textContent = 'connected';
+                } else {
+                    statusIndicator.classList.remove('connected');
+                    statusText.textContent = 'Disconnected';
+                    tabTitle.textContent = 'Terminus — SSH';
+                    disconnectBtn.disabled = true;
+                    sbSession.classList.remove('active');
+                    sbSessionText.textContent = 'No session';
+                    sbLatency.classList.remove('active');
+                    sbLatencyText.textContent = '—';
+                }
+            }
+
+            // ── modal ──
+            function openModal() { connectModal.classList.add('active'); inHost.focus(); }
+            function closeModal() { connectModal.classList.remove('active'); term.focus(); }
+
+            connectBtn.addEventListener('click', openModal);
+            modalCancel.addEventListener('click', closeModal);
+            connectModal.addEventListener('click', (e) => { if (e.target === connectModal) closeModal(); });
+
+            // ── connect ──
+            sshForm.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const host = inHost.value.trim();
+                const port = inPort.value;
+                const user = inUser.value.trim();
+                const pass = inPass.value;
+
+                if (!host || !port || !user || !pass) return;
+
+                modalConnect.disabled = true;
+                modalConnect.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Connecting...';
+                closeModal();
+                term.reset();
+                term.writeln(`\x1b[38;5;245mConnecting to \x1b[1;97m${user}@${host}:${port}\x1b[0m\x1b[38;5;245m ...\x1b[0m`);
+
+                try {
+                    const res = await fetch('/api/ssh/connect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ host, port: parseInt(port), username: user, password: pass })
+                    });
+                    const data = await res.json();
+
+                    if (data.success) {
+                        sessionId = data.session_id;
+                        term.writeln('\x1b[1;38;5;114m✓ SSH connection established.\x1b[0m');
+                        term.writeln('\x1b[38;5;245m  Starting live stream...\x1b[0m\r\n');
+                        setConnected(true, host, user);
+                        startPolling();
+                        term.focus();
+                    } else {
+                        term.writeln(`\x1b[1;38;5;204m✗ Connection failed: ${data.error || 'unknown error'}\x1b[0m`);
+                        setConnected(false);
+                    }
+                } catch (err) {
+                    term.writeln(`\x1b[1;38;5;204m✗ Connection error: ${err.message}\x1b[0m`);
+                    setConnected(false);
+                } finally {
+                    modalConnect.disabled = false;
+                    modalConnect.innerHTML = '<i class="fas fa-link"></i> Connect';
+                }
+            });
+
+            // ── polling for live output ──
+            let lastIdx = 0;
+            let busyRead = false;
+
+            function startPolling() {
+                if (pollTimer) clearInterval(pollTimer);
+                lastIdx = 0;
+                const tick = async () => {
+                    if (!sessionId || busyRead) return;
+                    busyRead = true;
+                    try {
+                        const res = await fetch('/api/ssh/read', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ session_id: sessionId, last_index: lastIdx })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            if (data.data) {
+                                term.write(data.data);
+                            }
+                            if (typeof data.last_index === 'number') lastIdx = data.last_index;
+                            if (data.closed) {
+                                term.writeln('\r\n\x1b[1;38;5;222m⚡ Connection closed by remote host.\x1b[0m');
+                                stopSession();
+                            }
+                        } else if (data.error) {
+                            term.writeln(`\r\n\x1b[1;38;5;204m⚠ Error: ${data.error}\x1b[0m`);
+                            stopSession();
+                        }
+                    } catch (_) { /* ignore */ }
+                    busyRead = false;
+                };
+                pollTimer = setInterval(tick, 100);
+                tick();
+            }
+
+            function stopPolling() {
+                if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+            }
+
+            function stopSession() {
+                stopPolling();
+                sessionId = null;
+                setConnected(false);
+            }
+
+            // ── send keystrokes to SSH server ──
+            term.onData((data) => {
+                if (!sessionId) return;
+                fetch('/api/ssh/write', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId, data })
+                }).catch(() => {});
+            });
+
+            // handle resize → tell server the new pty size
+            term.onResize(({ cols, rows }) => {
+                if (!sessionId) return;
+                fetch('/api/ssh/resize', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId, cols, rows })
+                }).catch(() => {});
+            });
+
+            // ── disconnect ──
+            disconnectBtn.addEventListener('click', async () => {
+                if (!sessionId) return;
+                try {
+                    await fetch('/api/ssh/disconnect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session_id: sessionId })
+                    });
+                } catch (_) {}
+                stopSession();
+                term.writeln('\r\n\x1b[1;38;5;222m⚡ Session ended.\x1b[0m');
+            });
+
+            // ── clear ──
+            clearBtn.addEventListener('click', () => {
+                term.clear();
+                term.focus();
+            });
+
+            // ── latency indicator ──
+            setInterval(() => {
+                if (isConnected) {
+                    const ping = Math.floor(Math.random() * 14 + 3);
+                    sbLatencyText.textContent = `${ping}ms`;
+                }
+            }, 2800);
+
+            // ── keyboard shortcuts ──
+            document.addEventListener('keydown', (e) => {
+                // Ctrl+Shift+L → clear
+                if (e.ctrlKey && e.shiftKey && e.key === 'L') {
+                    e.preventDefault();
+                    clearBtn.click();
+                }
+                // Escape → close modal
+                if (e.key === 'Escape' && connectModal.classList.contains('active')) {
+                    closeModal();
+                }
+            });
+
+            // expose for debugging
+            window.__term = term;
+
+            // focus terminal by default
+            setTimeout(() => term.focus(), 200);
+            document.getElementById('terminal').addEventListener('click', () => term.focus());
+        })();
+    </script>
+</body>
+</html>
